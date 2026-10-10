@@ -303,16 +303,24 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 			if err != nil {
 				return err
 			}
-			expectedAssignee := before.Assignee
-			nativeRequest := issueops.ReleaseRequest{
-				Actor: r.Actor, IssueID: r.Expected.IssueID, ExpectedAssignee: &expectedAssignee,
-			}
-			if err := workapi.ValidateReleaseRequest(nativeRequest); err != nil {
-				return err
-			}
-			native, write, err := storageissueops.ReleaseIssueInTx(ctx, tx, nativeRequest)
-			if err != nil {
-				return err
+			native := issueops.ReleaseResult{Issue: before, Changed: false}
+			write := storageissueops.ReleaseWrite{Tables: storageissueops.ChangedTables{}}
+			// The guarded role can acknowledge an already-completed lifecycle
+			// effect under this EXACT full-state expectation. Ordinary Releaser
+			// still requires a holder; no row, lease or unclaimed event is forged.
+			// Requested comments and the protected operation ledger follow below.
+			if before.Status != "open" || before.Assignee != "" {
+				expectedAssignee := before.Assignee
+				nativeRequest := issueops.ReleaseRequest{
+					Actor: r.Actor, IssueID: r.Expected.IssueID, ExpectedAssignee: &expectedAssignee,
+				}
+				if err := workapi.ValidateReleaseRequest(nativeRequest); err != nil {
+					return err
+				}
+				native, write, err = storageissueops.ReleaseIssueInTx(ctx, tx, nativeRequest)
+				if err != nil {
+					return err
+				}
 			}
 			nativeResult = native
 			if r.Effect.Kind == "release-with-comment" {
