@@ -290,22 +290,70 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 		if !reflect.DeepEqual(current, r.Expected) {
 			return guardtx.ErrConflict
 		}
-		before, err := storageissueops.GetIssueInTx(ctx, tx, r.Expected.IssueID)
-		if err != nil {
-			return err
+		var nativeResult any
+		tablesChanged := storageissueops.ChangedTables{}
+		if r.Effect.Kind == "clear-human-hold" {
+			nativeResult, err = applyHumanClearanceInTx(ctx, tx, r)
+			if err != nil {
+				return err
+			}
+			tablesChanged.Add("labels", "events", "config")
+		} else {
+			before, err := storageissueops.GetIssueInTx(ctx, tx, r.Expected.IssueID)
+			if err != nil {
+				return err
+			}
+			expectedAssignee := before.Assignee
+			nativeRequest := issueops.ReleaseRequest{
+				Actor: r.Actor, IssueID: r.Expected.IssueID, ExpectedAssignee: &expectedAssignee,
+			}
+			if err := workapi.ValidateReleaseRequest(nativeRequest); err != nil {
+				return err
+			}
+			native, write, err := storageissueops.ReleaseIssueInTx(ctx, tx, nativeRequest)
+			if err != nil {
+				return err
+			}
+			nativeResult = native
+			if r.Effect.Kind == "release-with-comment" {
+				comment, err := storageissueops.AddIssueCommentInTx(ctx, tx, r.Expected.IssueID, r.Actor, r.Effect.Comment)
+				if err != nil {
+					return err
+				}
+				var storedText string
+				if err := tx.QueryRowContext(ctx, "SELECT text FROM comments WHERE id=?", comment.ID).Scan(&storedText); err != nil {
+					return err
+				}
+				if storedText != r.Effect.Comment {
+					return fmt.Errorf("%w: native structured comment did not preserve exact text", guardtx.ErrUnsupported)
+				}
+				// The native audit column can be narrower than structured comments.
+				// Compare binary text counts around the native insert inside this TX:
+				// a warning/truncation must never become an acknowledged exact effect.
+				const exactEventCount = "SELECT COUNT(*) FROM events WHERE issue_id=? AND event_type='commented' AND actor=? AND CAST(comment AS BINARY)=CAST(? AS BINARY)"
+				var priorComments, currentComments int64
+				if err := tx.QueryRowContext(ctx, exactEventCount, r.Expected.IssueID, r.Actor, r.Effect.Comment).Scan(&priorComments); err != nil {
+					return err
+				}
+				if err := storageissueops.AddCommentEventInTx(ctx, tx, r.Expected.IssueID, r.Actor, r.Effect.Comment); err != nil {
+					return err
+				}
+				if err := tx.QueryRowContext(ctx, exactEventCount, r.Expected.IssueID, r.Actor, r.Effect.Comment).Scan(&currentComments); err != nil {
+					return err
+				}
+				if currentComments != priorComments+1 {
+					return fmt.Errorf("%w: native audit comment did not preserve exact text", guardtx.ErrUnsupported)
+				}
+				write.Tables.Add("comments")
+				write.Tables.Add("events")
+				nativeResult = struct {
+					issueops.ReleaseResult
+					CommentID string `json:"commentId"`
+				}{ReleaseResult: native, CommentID: comment.ID}
+			}
+			tablesChanged = write.Tables
 		}
-		expectedAssignee := before.Assignee
-		nativeRequest := issueops.ReleaseRequest{
-			Actor: r.Actor, IssueID: r.Expected.IssueID, ExpectedAssignee: &expectedAssignee,
-		}
-		if err := workapi.ValidateReleaseRequest(nativeRequest); err != nil {
-			return err
-		}
-		native, write, err := storageissueops.ReleaseIssueInTx(ctx, tx, nativeRequest)
-		if err != nil {
-			return err
-		}
-		raw, err := json.Marshal(native)
+		raw, err := json.Marshal(nativeResult)
 		if err != nil {
 			return err
 		}
@@ -318,9 +366,9 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 		if _, err := tx.ExecContext(ctx, `INSERT INTO bd_guard_operations(operation_id,request_digest,result_json) VALUES(?,?,?)`, r.OperationID, digest, string(saved)); err != nil {
 			return err
 		}
-		write.Tables.Add(guardtx.OperationsTable)
-		tables := make([]string, 0, len(write.Tables))
-		for table := range write.Tables {
+		tablesChanged.Add(guardtx.OperationsTable)
+		tables := make([]string, 0, len(tablesChanged))
+		for table := range tablesChanged {
 			tables = append(tables, table)
 		}
 		sort.Strings(tables)
@@ -328,7 +376,11 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 			return err
 		}
 		publicationStarted = true
-		return g.store.doltAddAndCommitInTx(ctx, tx, tables, "bd: guarded unclaim "+r.Expected.IssueID+" op "+r.OperationID)
+		message := "bd: guarded unclaim " + r.Expected.IssueID + " op " + r.OperationID
+		if r.Effect.Kind == "clear-human-hold" {
+			message = "bd: guarded clear human hold " + r.Expected.IssueID + " op " + r.OperationID
+		}
+		return g.store.doltAddAndCommitInTx(ctx, tx, tables, message)
 	})
 	if err != nil {
 		result.ResultJSON = ""
@@ -357,4 +409,56 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 	}
 	verified.Replayed = result.Replayed
 	return verified, nil
+}
+
+// applyHumanClearanceInTx publishes only prospective identified evidence. The
+// original full native expectation has already matched; no legacy-history
+// completeness is inferred here, and the claim/lease/material remain unchanged.
+func applyHumanClearanceInTx(ctx context.Context, tx *sql.Tx, r guardops.Request) (any, error) {
+	var held int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM labels WHERE issue_id=? AND CAST(label AS BINARY)=CAST('human-required' AS BINARY)", r.Expected.IssueID).Scan(&held); err != nil {
+		return nil, err
+	}
+	if held != 1 {
+		return nil, fmt.Errorf("%w: current human-required hold required", guardtx.ErrUnsupported)
+	}
+	for _, key := range []string{r.Effect.ClearanceKey, r.Effect.HistoryKey} {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM config WHERE `key`=?", "kv."+key).Scan(&count); err != nil {
+			return nil, err
+		}
+		if count != 0 {
+			return nil, fmt.Errorf("%w: immutable clearance record key already exists", guardtx.ErrUnsupported)
+		}
+	}
+	if err := storageissueops.RemoveLabelInTx(ctx, tx, "labels", "events", r.Expected.IssueID, "human-required", r.Actor); err != nil {
+		return nil, err
+	}
+	for _, record := range []struct{ key, value string }{{r.Effect.ClearanceKey, r.Effect.ClearanceValue}, {r.Effect.HistoryKey, r.Effect.HistoryValue}} {
+		key := "kv." + record.key
+		if err := storageissueops.SetConfigInTx(ctx, tx, key, record.value); err != nil {
+			return nil, err
+		}
+		var storedKey, storedValue string
+		if err := tx.QueryRowContext(ctx, "SELECT `key`,value FROM config WHERE `key`=?", key).Scan(&storedKey, &storedValue); err != nil {
+			return nil, err
+		}
+		if storedKey != key || storedValue != record.value {
+			return nil, fmt.Errorf("%w: native clearance record did not preserve exact bytes", guardtx.ErrUnsupported)
+		}
+	}
+	var clearance struct {
+		Value struct {
+			MaterialVersion string `json:"materialVersion"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal([]byte(r.Effect.ClearanceValue), &clearance); err != nil {
+		return nil, err
+	}
+	return struct {
+		IssueID         string `json:"issueId"`
+		Cleared         bool   `json:"cleared"`
+		MaterialVersion string `json:"materialVersion"`
+		HistoryComplete bool   `json:"historyComplete"`
+	}{r.Expected.IssueID, true, clearance.Value.MaterialVersion, false}, nil
 }

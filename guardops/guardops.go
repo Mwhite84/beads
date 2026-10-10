@@ -15,6 +15,8 @@ import (
 const Protocol = "beads.guard.v1"
 const MaxStateBytes = 16 << 20
 const MaxContextBytes = 1 << 20
+const MaxCommentBytes = 1 << 20
+const MaxClearanceRecordBytes = 64 << 10
 
 type Snapshot struct {
 	Protocol string `json:"protocol"`
@@ -32,7 +34,12 @@ type Snapshot struct {
 }
 
 type Effect struct {
-	Kind string `json:"kind"`
+	Kind           string `json:"kind"`
+	Comment        string `json:"comment,omitempty"`
+	ClearanceKey   string `json:"clearanceKey,omitempty"`
+	ClearanceValue string `json:"clearanceValue,omitempty"`
+	HistoryKey     string `json:"historyKey,omitempty"`
+	HistoryValue   string `json:"historyValue,omitempty"`
 }
 type Request struct {
 	Protocol    string   `json:"protocol"`
@@ -75,9 +82,15 @@ var ErrValidation = errors.New("guard: invalid request")
 
 func Digest(r Request) string {
 	e := r.Expected
-	return digestStrings([]string{r.Protocol, r.OperationID, r.Actor, e.Protocol,
+	fields := []string{r.Protocol, r.OperationID, r.Actor, e.Protocol,
 		e.IssueID, e.Database, e.Branch, e.Head, e.Root, e.Generation, e.Token,
-		e.StateJSON, r.Effect.Kind, r.ContextJSON})
+		e.StateJSON, r.Effect.Kind}
+	if r.Effect.Kind == "release-with-comment" {
+		fields = append(fields, r.Effect.Comment)
+	} else if r.Effect.Kind == "clear-human-hold" {
+		fields = append(fields, r.Effect.ClearanceKey, r.Effect.ClearanceValue, r.Effect.HistoryKey, r.Effect.HistoryValue)
+	}
+	return digestStrings(append(fields, r.ContextJSON))
 }
 
 func SnapshotDigest(e Snapshot) string {
@@ -109,11 +122,30 @@ func ValidateSnapshot(s Snapshot) error {
 }
 
 func ValidateRequest(r Request) error {
-	if r.Protocol != Protocol || r.Effect.Kind != "release" ||
+	if r.Protocol != Protocol ||
 		strings.TrimSpace(r.OperationID) == "" || len(r.OperationID) > 128 ||
 		strings.TrimSpace(r.Actor) == "" || len(r.Actor) > 256 || len(r.ContextJSON) > MaxContextBytes ||
 		strings.TrimSpace(r.ContextJSON) == "" || !utf8.ValidString(r.OperationID) ||
 		!utf8.ValidString(r.Actor) || !utf8.ValidString(r.ContextJSON) {
+		return ErrValidation
+	}
+	switch r.Effect.Kind {
+	case "release":
+		if r.Effect.Comment != "" || hasClearanceFields(r.Effect) {
+			return ErrValidation
+		}
+	case "release-with-comment":
+		if hasClearanceFields(r.Effect) || strings.TrimSpace(r.Effect.Comment) == "" || len(r.Effect.Comment) > MaxCommentBytes || !utf8.ValidString(r.Effect.Comment) {
+			return ErrValidation
+		}
+	case "clear-human-hold":
+		if r.Effect.Comment != "" || len(r.Actor) > 255 {
+			return ErrValidation
+		}
+		if err := validateClearanceEffect(r); err != nil {
+			return err
+		}
+	default:
 		return ErrValidation
 	}
 	return ValidateSnapshot(r.Expected)

@@ -10,7 +10,7 @@ import (
 )
 
 // MaxWireBytes allows the worst-case JSON escaping of bounded opaque strings.
-const MaxWireBytes = 6*(MaxStateBytes+MaxContextBytes) + (1 << 20)
+const MaxWireBytes = 6*(MaxStateBytes+MaxContextBytes+MaxCommentBytes+2*MaxClearanceRecordBytes) + (1 << 20)
 
 func DecodeRequest(raw []byte) (Request, error) {
 	var request Request
@@ -47,11 +47,27 @@ func decodeExact(raw []byte, target any) error {
 	var shape wireShape
 	switch target.(type) {
 	case *Request:
+		var discriminator struct {
+			Effect struct {
+				Kind string `json:"kind"`
+			} `json:"effect"`
+		}
+		if err := json.Unmarshal(raw, &discriminator); err != nil {
+			return fmt.Errorf("%w: invalid effect shape", ErrValidation)
+		}
+		effectShape := wireShape{"kind": nil}
+		if discriminator.Effect.Kind == "release-with-comment" {
+			effectShape["comment"] = nil
+		} else if discriminator.Effect.Kind == "clear-human-hold" {
+			for _, key := range []string{"clearanceKey", "clearanceValue", "historyKey", "historyValue"} {
+				effectShape[key] = nil
+			}
+		}
 		shape = wireShape{
 			"protocol": nil, "operationId": nil, "actor": nil, "contextJson": nil,
 			"expected": {"protocol": nil, "issueId": nil, "database": nil, "branch": nil,
 				"head": nil, "root": nil, "generation": nil, "token": nil, "stateJson": nil},
-			"effect": {"kind": nil},
+			"effect": effectShape,
 		}
 	case *LookupRequest:
 		shape = wireShape{"protocol": nil, "operationId": nil, "requestDigest": nil}
