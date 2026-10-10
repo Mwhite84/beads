@@ -13,6 +13,8 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
@@ -81,6 +83,11 @@ func (r *issueSQLRepositoryImpl) Insert(ctx context.Context, issue *types.Issue,
 		}, domain.RecordEventOpts{UseWispsTable: opts.UseWispsTable}); err != nil {
 			return err
 		}
+		if !opts.UseWispsTable {
+			if _, err := guardbirth.Spend(ctx, r.runner, issue.ID, actor, "domain-insert-unenrolled"); err != nil {
+				return err
+			}
+		}
 		return issueops.RecordEventInTx(ctx, r.runner, issueops.EventCreate, issue.ID, actor)
 	}
 	if err := insertIssueRow(ctx, r.runner, table, issue); err != nil {
@@ -92,6 +99,11 @@ func (r *issueSQLRepositoryImpl) Insert(ctx context.Context, issue *types.Issue,
 		Actor:   actor,
 	}, domain.RecordEventOpts{UseWispsTable: opts.UseWispsTable}); err != nil {
 		return err
+	}
+	if !opts.UseWispsTable {
+		if _, err := guardbirth.Spend(ctx, r.runner, issue.ID, actor, "domain-insert-unenrolled"); err != nil {
+			return err
+		}
 	}
 	return issueops.RecordEventInTx(ctx, r.runner, issueops.EventCreate, issue.ID, actor)
 }
@@ -960,6 +972,17 @@ func (r *issueSQLRepositoryImpl) Delete(ctx context.Context, id string, opts dom
 	if opts.UseWispsTable {
 		table = "wisps"
 	}
+	if !opts.UseWispsTable && guardtx.Bound(r.runner) {
+		actual, err := issueops.ExistingIssueIDsInTableInTx(ctx, r.runner, "issues", []string{id})
+		if err != nil {
+			return err
+		}
+		for _, key := range actual {
+			if _, err := guardbirth.Spend(ctx, r.runner, key, actor, "domain-durable-delete"); err != nil {
+				return err
+			}
+		}
+	}
 	// Edges are journaled before the row goes, while its snapshot can still be
 	// read.
 	if err := issueops.RecordDependencyRemovalsForIssuesInTx(ctx, r.runner, []string{id}, actor); err != nil {
@@ -1000,6 +1023,13 @@ func (r *issueSQLRepositoryImpl) DeleteByIDs(ctx context.Context, ids []string, 
 	actualIDs, err := issueops.ExistingIssueIDsInTableInTx(ctx, r.runner, table, ids)
 	if err != nil {
 		return 0, fmt.Errorf("db: IssueSQLRepository.DeleteByIDs resolve existing ids: %w", err)
+	}
+	if !opts.UseWispsTable {
+		for _, id := range actualIDs {
+			if _, err := guardbirth.Spend(ctx, r.runner, id, actor, "domain-durable-bulk-delete"); err != nil {
+				return 0, err
+			}
+		}
 	}
 	// Edges are journaled before the rows go, while their source snapshots can
 	// still be read.

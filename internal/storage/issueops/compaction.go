@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -163,6 +164,9 @@ func RestoreFromSnapshotInTx(ctx context.Context, tx *sql.Tx, issueID string) (*
 		return nil, nil
 	}
 
+	if _, err := guardbirth.Spend(ctx, tx, issueID, "", "compaction-restore"); err != nil {
+		return nil, err
+	}
 	now := time.Now().UTC()
 	newLevel := max(snap.CompactionLevel-1, 0)
 

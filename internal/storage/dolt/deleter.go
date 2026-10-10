@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
 	"github.com/steveyegge/beads/internal/storage/guardtx"
 	storeops "github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
@@ -87,7 +88,7 @@ func (s *deleter) Delete(ctx context.Context, req issueops.DeleteRequest) (issue
 		if err := guardtx.Prepare(ctx, tx); err != nil {
 			return err
 		}
-		for _, table := range sweptTables {
+		for _, table := range guardbirth.PublicationTables(tx, sweptTables) {
 			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
 		}
 		staged, err := storeops.HasStagedChanges(ctx, tx)

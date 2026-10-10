@@ -15,12 +15,14 @@ type RecordAttestationRequest struct {
 	RecordValue string   `json:"recordValue"`
 }
 type RecordAttestationResult struct {
-	Protocol          string  `json:"protocol"`
-	RecordKey         string  `json:"recordKey"`
-	RecordValueDigest string  `json:"recordValueDigest"`
-	Outcome           string  `json:"outcome"`
-	Operation         *Result `json:"operation,omitempty"`
-	Reason            string  `json:"reason,omitempty"`
+	Protocol                 string  `json:"protocol"`
+	RecordKey                string  `json:"recordKey"`
+	RecordValueDigest        string  `json:"recordValueDigest"`
+	Outcome                  string  `json:"outcome"`
+	Operation                *Result `json:"operation,omitempty"`
+	Reason                   string  `json:"reason,omitempty"`
+	InitialHoldEligible      *bool   `json:"initialHoldEligible,omitempty"`
+	CurrentIncarnationIntact *bool   `json:"currentIncarnationIntact,omitempty"`
 }
 
 // Independent optional read capability; digest-required Lookup remains unchanged.

@@ -19,8 +19,8 @@ func TestGuardProxyFrontDoorRefusesEveryTopology(t *testing.T) {
 		ProxyTopologyAny, ProxyTopologyManagedLocal, ProxyTopologyExternalTCP,
 		ProxyTopologyExternalUnix, ProxyTopologyTeamServer, ProxyTopologyUnknown,
 	}
-	if got := len(guardCmd.Commands()); got != 5 {
-		t.Fatalf("guard command count = %d, want capture/apply/lookup/attest-record/initialize", got)
+	if got := len(guardCmd.Commands()); got != 7 {
+		t.Fatalf("guard command count = %d, want capture/apply/lookup/attest-record/initialize/explain/lookup-explanation", got)
 	}
 	for _, command := range guardCmd.Commands() {
 		for _, topology := range topologies {

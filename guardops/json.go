@@ -71,6 +71,10 @@ func decodeExact(raw []byte, target any) error {
 			}
 		} else if discriminator.Effect.Kind == "validate" {
 			effectShape["receiptRecordsJson"] = nil
+		} else if discriminator.Effect.Kind == "add-initial-human-hold" {
+			for _, key := range []string{"materialVersion", "clearanceNamespace", "clearanceContentDigest", "holdRecordKey", "holdRecordValue", "birthRecordKey", "birthRecordValueDigest"} {
+				effectShape[key] = nil
+			}
 		} else if discriminator.Effect.Kind == "add-human-hold" {
 			for _, key := range []string{"materialVersion", "clearanceNamespace", "clearanceContentDigest", "holdRecordKey", "holdRecordValue"} {
 				effectShape[key] = nil

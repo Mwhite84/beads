@@ -49,6 +49,8 @@ type Effect struct {
 	ClearanceContentDigest string `json:"clearanceContentDigest,omitempty"`
 	HoldRecordKey          string `json:"holdRecordKey,omitempty"`
 	HoldRecordValue        string `json:"holdRecordValue,omitempty"`
+	BirthRecordKey         string `json:"birthRecordKey,omitempty"`
+	BirthRecordValueDigest string `json:"birthRecordValueDigest,omitempty"`
 }
 type Request struct {
 	Protocol    string   `json:"protocol"`
@@ -104,6 +106,8 @@ func Digest(r Request) string {
 		fields = append(fields, r.Effect.ArchiveComment, r.Effect.AcceptedDescription, r.Effect.ReceiptRecordsJSON)
 	} else if r.Effect.Kind == "validate" {
 		fields = append(fields, r.Effect.ReceiptRecordsJSON)
+	} else if r.Effect.Kind == "add-initial-human-hold" {
+		fields = append(fields, r.Effect.MaterialVersion, r.Effect.ClearanceNamespace, r.Effect.ClearanceContentDigest, r.Effect.HoldRecordKey, r.Effect.HoldRecordValue, r.Effect.BirthRecordKey, r.Effect.BirthRecordValueDigest)
 	} else if r.Effect.Kind == "add-human-hold" {
 		fields = append(fields, r.Effect.MaterialVersion, r.Effect.ClearanceNamespace, r.Effect.ClearanceContentDigest, r.Effect.HoldRecordKey, r.Effect.HoldRecordValue)
 	}
@@ -146,6 +150,9 @@ func ValidateRequest(r Request) error {
 		!utf8.ValidString(r.Actor) || !utf8.ValidString(r.ContextJSON) {
 		return ErrValidation
 	}
+	if r.Effect.Kind != "add-initial-human-hold" && (r.Effect.BirthRecordKey != "" || r.Effect.BirthRecordValueDigest != "") {
+		return ErrValidation
+	}
 	if r.Effect.Kind != "release-retire-pointer" && r.Effect.ClaimPointer != "" {
 		return ErrValidation
 	}
@@ -177,6 +184,13 @@ func ValidateRequest(r Request) error {
 			return ErrValidation
 		}
 		if err := validateClearanceEffect(r); err != nil {
+			return err
+		}
+	case "add-initial-human-hold":
+		if r.Effect.Comment != "" || hasClearanceFields(r.Effect) || r.Effect.ArchiveComment != "" || r.Effect.AcceptedDescription != "" || r.Effect.ReceiptRecordsJSON != "" || len(r.Actor) > 255 {
+			return ErrValidation
+		}
+		if _, err := DecodeInitialAuditHoldRecord(r); err != nil {
 			return err
 		}
 	case "archive-replace", "validate", "add-human-hold":

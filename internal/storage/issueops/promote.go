@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -52,6 +53,9 @@ func PromoteFromEphemeralInTx(ctx context.Context, tx DBTX, id string, actor str
 	}
 	if err := PrepareIssueForInsert(issue, types.CustomStatusNames(customStatuses), customTypes); err != nil {
 		return fmt.Errorf("promote wisp to issues: %w", err)
+	}
+	if _, err := guardbirth.Spend(ctx, tx, id, actor, "promotion-import"); err != nil {
+		return err
 	}
 	if _, _, err := InsertIssueIfNew(ctx, tx, "issues", issue, storage.BatchCreateOptions{}); err != nil {
 		return fmt.Errorf("promote wisp to issues: %w", err)

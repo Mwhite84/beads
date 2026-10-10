@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/workapi"
 	publicops "github.com/steveyegge/beads/issueops"
@@ -59,6 +61,11 @@ func DeleteIssueInTx(ctx context.Context, tx *sql.Tx, id string, actor string) e
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
 func deleteIssueRowInTx(ctx context.Context, tx *sql.Tx, id string, isWisp bool, actor string) error {
 	issueTable, _, _, _ := WispTableRouting(isWisp)
+	if !isWisp {
+		if _, err := guardbirth.Spend(ctx, tx, id, actor, "durable-delete"); err != nil {
+			return err
+		}
+	}
 	result, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE id = ?", issueTable), id)
 	if err != nil {
 		return fmt.Errorf("delete issue from %s: %w", issueTable, err)
@@ -340,6 +347,18 @@ func DeleteResolvedSetInTx(ctx context.Context, tx *sql.Tx, set DeletionSet, dry
 	journaledDeletes, err := journalableDeletesInTx(ctx, tx, "issues", set.RegularIDs)
 	if err != nil {
 		return nil, err
+	}
+	birthDeletes := journaledDeletes
+	if guardtx.Bound(tx) {
+		birthDeletes, err = ExistingIssueIDsInTableInTx(ctx, tx, "issues", set.RegularIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, id := range birthDeletes {
+		if _, err := guardbirth.Spend(ctx, tx, id, actor, "durable-bulk-delete"); err != nil {
+			return nil, err
+		}
 	}
 	// Edges are journaled before the rows go, while their source snapshots can
 	// still be read.

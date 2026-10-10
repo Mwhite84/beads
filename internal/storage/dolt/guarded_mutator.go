@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
 	"reflect"
 	"sort"
 	"strconv"
@@ -322,6 +323,12 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 			if err != nil {
 				return err
 			}
+		} else if r.Effect.Kind == "add-initial-human-hold" {
+			nativeResult, err = applyInitialAuditHumanHoldInTx(ctx, tx, r)
+			if err != nil {
+				return err
+			}
+			tablesChanged.Add("labels", "events", "config")
 		} else if r.Effect.Kind == "add-human-hold" {
 			nativeResult, err = applyAuditHumanHoldInTx(ctx, tx, r)
 			if err != nil {
@@ -454,14 +461,14 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 			tables = append(tables, table)
 		}
 		sort.Strings(tables)
-		if err := guardtx.Prepare(ctx, tx); err != nil {
+		if err := prepareAuditExplanationBinding(ctx, tx, r); err != nil {
 			return err
 		}
 		publicationStarted = true
 		message := "bd: guarded unclaim " + r.Expected.IssueID + " op " + r.OperationID
 		if r.Effect.Kind == "clear-human-hold" {
 			message = "bd: guarded clear human hold " + r.Expected.IssueID + " op " + r.OperationID
-		} else if r.Effect.Kind == "archive-replace" || r.Effect.Kind == "validate" || r.Effect.Kind == "add-human-hold" || r.Effect.Kind == "audit-comment" {
+		} else if r.Effect.Kind == "archive-replace" || r.Effect.Kind == "validate" || r.Effect.Kind == "add-human-hold" || r.Effect.Kind == "add-initial-human-hold" || r.Effect.Kind == "audit-comment" {
 			message = "bd: guarded audit " + r.Effect.Kind + " " + r.Expected.IssueID + " op " + r.OperationID
 		}
 		return g.store.doltAddAndCommitInTx(ctx, tx, tables, message)
@@ -920,6 +927,28 @@ func verifyAuditClearanceProvenance(ctx context.Context, tx *sql.Tx, r guardops.
 		if json.Unmarshal([]byte(record.Value), &discriminator) != nil {
 			return fmt.Errorf("%w: unknown prospective hold history", guardtx.ErrUnsupported)
 		}
+		if discriminator.Value.Kind == "initial-unworkable-hold" {
+			var initial guardops.InitialAuditHoldEnvelope
+			if json.Unmarshal([]byte(record.Value), &initial) != nil {
+				return guardtx.ErrUnsupported
+			}
+			var savedRaw string
+			if err := tx.QueryRowContext(ctx, "SELECT result_json FROM bd_guard_operations WHERE operation_id=?", initial.Value.OperationID).Scan(&savedRaw); err != nil {
+				return err
+			}
+			var saved guardops.Result
+			if json.Unmarshal([]byte(savedRaw), &saved) != nil || saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.OperationID != initial.Value.OperationID {
+				return guardtx.ErrUnsupported
+			}
+			linked, err := attestInitialNativeRecord(ctx, tx, guardops.RecordAttestationRequest{Expected: r.Expected, RecordKey: record.Key, RecordValue: record.Value}, saved)
+			if err != nil {
+				return err
+			}
+			if !linked {
+				return guardtx.ErrUnsupported
+			}
+			continue
+		}
 		if discriminator.Value.Kind == "bounded-unworkable-hold" {
 			var prior guardops.AuditHoldEnvelope
 			if json.Unmarshal([]byte(record.Value), &prior) != nil {
@@ -1087,6 +1116,13 @@ func (g *guardedMutator) AttestRecord(ctx context.Context, r guardops.RecordAtte
 		}
 		var identified *guardops.Result
 		for _, e := range entries {
+			// Distinct delivery ledgers are not audit mutation evidence.
+			var discriminator struct {
+				Protocol string `json:"protocol"`
+			}
+			if json.Unmarshal([]byte(e.raw), &discriminator) != nil || discriminator.Protocol != guardops.Protocol {
+				continue
+			}
 			var saved guardops.Result
 			if json.Unmarshal([]byte(e.raw), &saved) != nil || saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.OperationID != e.id || saved.RequestDigest != e.digest || guardops.ValidateLookup(guardops.LookupRequest{Protocol: guardops.Protocol, OperationID: e.id, RequestDigest: e.digest}) != nil {
 				continue
@@ -1106,6 +1142,28 @@ func (g *guardedMutator) AttestRecord(ctx context.Context, r guardops.RecordAtte
 		if identified != nil {
 			result.Outcome = "identified"
 			result.Operation = identified
+			var kind struct {
+				Value struct {
+					Kind string `json:"kind"`
+				} `json:"value"`
+			}
+			if json.Unmarshal([]byte(r.RecordValue), &kind) != nil {
+				return guardtx.ErrUnsupported
+			}
+			if kind.Value.Kind == "native-create-birth" || kind.Value.Kind == "initial-unworkable-hold" {
+				intact, err := guardbirth.Intact(ctx, tx, r.Expected.IssueID)
+				if err != nil {
+					return err
+				}
+				result.CurrentIncarnationIntact = &intact
+				if kind.Value.Kind == "native-create-birth" {
+					eligible, err := nativeBirthAdmission(ctx, tx, r.Expected.IssueID)
+					if err != nil {
+						return err
+					}
+					result.InitialHoldEligible = &eligible
+				}
+			}
 		} else {
 			result.Reason = "record lacks exact native ledger and event binding"
 		}
@@ -1114,12 +1172,22 @@ func (g *guardedMutator) AttestRecord(ctx context.Context, r guardops.RecordAtte
 	if err != nil {
 		result.Outcome = "unknown"
 		result.Operation = nil
+		result.InitialHoldEligible = nil
+		result.CurrentIncarnationIntact = nil
 		result.Reason = err.Error()
 	}
 	return result, err
 }
 
 func attestNativeAuditRecord(ctx context.Context, tx *sql.Tx, r guardops.RecordAttestationRequest, saved guardops.Result) (bool, error) {
+	var kind struct {
+		Value struct {
+			Kind string `json:"kind"`
+		} `json:"value"`
+	}
+	if json.Unmarshal([]byte(r.RecordValue), &kind) == nil && (kind.Value.Kind == "native-create-birth" || kind.Value.Kind == "initial-unworkable-hold") {
+		return attestInitialNativeRecord(ctx, tx, r, saved)
+	}
 	var body struct {
 		IssueID                  string `json:"issueId"`
 		Held                     bool   `json:"held"`

@@ -51,7 +51,11 @@ func readGuardRequest(cmd *cobra.Command, target any) error {
 		reader = file
 	}
 	// JSON escaping may expand the 16 MiB native state by up to six bytes.
-	raw, err := io.ReadAll(io.LimitReader(reader, guardops.MaxWireBytes+1))
+	limit := int64(guardops.MaxWireBytes)
+	if _, ok := target.(*guardops.ExplanationRequest); ok {
+		limit *= 2 // original and fresh permission snapshots are independently bounded.
+	}
+	raw, err := io.ReadAll(io.LimitReader(reader, limit+1))
 	if err != nil {
 		return err
 	}
@@ -62,6 +66,10 @@ func readGuardRequest(cmd *cobra.Command, target any) error {
 		*request, err = guardops.DecodeRecordAttestation(raw)
 	case *guardops.LookupRequest:
 		*request, err = guardops.DecodeLookup(raw)
+	case *guardops.ExplanationRequest:
+		*request, err = guardops.DecodeExplanation(raw)
+	case *guardops.ExplanationLookupRequest:
+		*request, err = guardops.DecodeExplanationLookup(raw)
 	default:
 		return fmt.Errorf("guard: unsupported request type")
 	}

@@ -42,10 +42,11 @@ type starter interface {
 }
 
 type scope struct {
-	root       string
-	token      string
-	generation string
-	failure    error
+	root        string
+	token       string
+	generation  string
+	failure     error
+	publication map[string]bool
 }
 
 // Native transactions are serially owned by their caller. The map only owns
@@ -190,4 +191,33 @@ func FreshIdentity() (string, error) {
 		return "", fmt.Errorf("guard: random identity: %w", err)
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// NotePublicationTables records only native work actually inserted by this
+// registered transaction. It does not change runner identity or enable guards.
+func NotePublicationTables(r Runner, tables ...string) {
+	entry, ok := scopes.Load(r)
+	if !ok {
+		return
+	}
+	s := entry.(*scope)
+	if s.publication == nil {
+		s.publication = map[string]bool{}
+	}
+	for _, table := range tables {
+		s.publication[table] = true
+	}
+}
+
+// PublicationTables returns a detached copy BEFORE Commit/Forget.
+func PublicationTables(r Runner) map[string]bool {
+	result := map[string]bool{}
+	entry, ok := scopes.Load(r)
+	if !ok {
+		return result
+	}
+	for table := range entry.(*scope).publication {
+		result[table] = true
+	}
+	return result
 }

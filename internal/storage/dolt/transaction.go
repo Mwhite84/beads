@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
@@ -869,7 +870,7 @@ func (t *doltTransaction) DeleteIssue(ctx context.Context, id string) error {
 	// Mark every table the ON DELETE CASCADE fans out to, not just the row's
 	// own table: the cascaded deletions are invisible to the SQL we issue, so
 	// staging only `issues` leaves them uncommitted in the working set.
-	for _, cascaded := range issueops.DeleteCascadeTables(isWisp) {
+	for _, cascaded := range guardbirth.PublicationTables(t.txFor(table), issueops.DeleteCascadeTables(isWisp)) {
 		t.dirty.MarkDirty(cascaded)
 	}
 	return nil

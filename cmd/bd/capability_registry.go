@@ -250,6 +250,8 @@ var proxyCapabilityRegistry = []capabilityRow{
 	refusedPath("guard lookup", "proxy.guard.unsupported", ProxyReasonUnimplemented, "experimental guarded storage: proxied role"),
 	// Read-only attestation still requires the direct native optional role.
 	refusedPath("guard attest-record", "proxy.guard.unsupported", ProxyReasonUnimplemented, "experimental guarded storage: proxied role"),
+	refusedPath("guard explain", "proxy.guard.unsupported", ProxyReasonUnimplemented, "experimental guarded storage: proxied role"),
+	refusedPath("guard lookup-explanation", "proxy.guard.unsupported", ProxyReasonUnimplemented, "experimental guarded storage: proxied role"),
 	refusedPath("guard initialize", "proxy.guard.unsupported", ProxyReasonUnimplemented, "experimental guarded storage: proxied role"),
 
 	// --- doctor -------------------------------------------------------------

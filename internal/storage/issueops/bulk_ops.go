@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -197,6 +198,11 @@ func DeleteIssuesBySourceRepoInTx(ctx context.Context, tx *sql.Tx, sourceRepo st
 		return 0, fmt.Errorf("affected by source-repo delete: %w", aerr)
 	}
 
+	for _, id := range issueIDs {
+		if _, err := guardbirth.Spend(ctx, tx, id, "", "source-repo-delete"); err != nil {
+			return 0, err
+		}
+	}
 	// Deleted issues hold no leases: clear them while the id set is still
 	// joinable (before the issues rows go away).
 	if _, err := tx.ExecContext(ctx,
@@ -256,8 +262,15 @@ func UpdateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, iss
 		if err := updateWispIDInTx(ctx, tx, oldID, newID, issue, actor); err != nil {
 			return err
 		}
-	} else if err := updateIssueIDInTx(ctx, tx, oldID, newID, issue, actor); err != nil {
-		return err
+	} else {
+		for _, id := range []string{oldID, newID} {
+			if _, err := guardbirth.Spend(ctx, tx, id, actor, "durable-identity-rename"); err != nil {
+				return err
+			}
+		}
+		if err := updateIssueIDInTx(ctx, tx, oldID, newID, issue, actor); err != nil {
+			return err
+		}
 	}
 	return recordRenameInJournal(ctx, tx, oldID, newID, actor, renameEdges)
 }

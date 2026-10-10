@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
@@ -212,7 +213,7 @@ func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor s
 		if err := issueops.PromoteFromEphemeralInTx(ctx, tx, id, actor); err != nil {
 			return err
 		}
-		return s.doltAddAndCommitInTx(ctx, tx, permanentIssueAuxTables, fmt.Sprintf("bd: promote %s", id))
+		return s.doltAddAndCommitInTx(ctx, tx, guardbirth.PublicationTables(tx, permanentIssueAuxTables), fmt.Sprintf("bd: promote %s", id))
 	}); err != nil {
 		return err
 	}
@@ -239,6 +240,9 @@ func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[str
 // atomic version precondition in the same transaction; DemoteToWisp's behavior
 // is unchanged.
 func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string) error {
+	if _, err := guardbirth.Spend(ctx, tx, id, actor, "durable-demotion"); err != nil {
+		return err
+	}
 	if _, err := issueops.UpdateIssueWithoutEventInTx(ctx, tx, id, updates, actor); err != nil {
 		return fmt.Errorf("update issue before demotion: %w", err)
 	}
@@ -332,7 +336,7 @@ func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string,
 		return err
 	}
 
-	return s.doltAddAndCommitInTx(ctx, tx, permanentIssueAuxTables, fmt.Sprintf("bd: demote %s to wisp", id))
+	return s.doltAddAndCommitInTx(ctx, tx, guardbirth.PublicationTables(tx, permanentIssueAuxTables), fmt.Sprintf("bd: demote %s to wisp", id))
 }
 
 // doltAddAndCommitInTx stages and Dolt-commits INSIDE a still-open SQL
