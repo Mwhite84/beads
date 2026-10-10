@@ -58,6 +58,8 @@ func readGuardRequest(cmd *cobra.Command, target any) error {
 	switch request := target.(type) {
 	case *guardops.Request:
 		*request, err = guardops.DecodeRequest(raw)
+	case *guardops.RecordAttestationRequest:
+		*request, err = guardops.DecodeRecordAttestation(raw)
 	case *guardops.LookupRequest:
 		*request, err = guardops.DecodeLookup(raw)
 	default:
@@ -128,6 +130,28 @@ func init() {
 			return outputJSONRaw(result)
 		},
 	}
+	attest := &cobra.Command{
+		Use: "attest-record", Short: "Authenticate one exact captured audit record against its native operation", Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			var request guardops.RecordAttestationRequest
+			if err := readGuardRequest(cmd, &request); err != nil {
+				return err
+			}
+			if usesProxiedServer() || store == nil {
+				return fmt.Errorf("guard: initialized direct server storage required")
+			}
+			provider, ok := storage.UnwrapStore(store).(guardops.RecordAttestationProvider)
+			if !ok {
+				return fmt.Errorf("guard: backend does not support audit record attestation")
+			}
+			role, err := provider.GuardedRecordAttester()
+			if err != nil {
+				return err
+			}
+			result, _ := role.AttestRecord(rootCtx, request)
+			return outputJSONRaw(result)
+		},
+	}
 	initialize := &cobra.Command{
 		Use: "initialize", Short: "Initialize an experimental disposable database under maintenance exclusivity", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -152,11 +176,11 @@ func init() {
 			return outputJSONRaw(map[string]string{"protocol": guardops.Protocol, "outcome": "initialized"})
 		},
 	}
-	for _, command := range []*cobra.Command{apply, lookup} {
+	for _, command := range []*cobra.Command{apply, lookup, attest} {
 		command.Flags().String("request-json", "", "Request JSON file, or - for stdin")
 		_ = command.MarkFlagRequired("request-json")
 	}
 	initialize.Flags().Bool("experimental", false, "Explicitly initialize only disposable local data")
-	guardCmd.AddCommand(capture, apply, lookup, initialize)
+	guardCmd.AddCommand(capture, apply, lookup, attest, initialize)
 	rootCmd.AddCommand(guardCmd)
 }

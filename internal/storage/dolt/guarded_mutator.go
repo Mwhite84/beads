@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -331,6 +333,16 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 			if err != nil {
 				return err
 			}
+			var retiredMetadata map[string]json.RawMessage
+			if r.Effect.Kind == "release-retire-pointer" {
+				if before.Status != "open" && before.Status != "in_progress" {
+					return guardtx.ErrUnsupported
+				}
+				retiredMetadata, err = guardops.RetirePointerMetadata(before.Metadata, r.Effect.ClaimPointer)
+				if err != nil {
+					return err
+				}
+			}
 			native := issueops.ReleaseResult{Issue: before, Changed: false}
 			write := storageissueops.ReleaseWrite{Tables: storageissueops.ChangedTables{}}
 			// The guarded role can acknowledge an already-completed lifecycle
@@ -351,7 +363,41 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 				}
 			}
 			nativeResult = native
-			if r.Effect.Kind == "release-with-comment" {
+			if r.Effect.Kind == "release-retire-pointer" {
+				if err := storageissueops.DeleteMetadataInTx(ctx, tx, r.Expected.IssueID, "krewe_claim_run", r.Actor); err != nil {
+					return err
+				}
+				updated, err := storageissueops.GetIssueInTx(ctx, tx, r.Expected.IssueID)
+				if err != nil {
+					return err
+				}
+				actual := map[string]json.RawMessage{}
+				if len(updated.Metadata) > 0 && json.Unmarshal(updated.Metadata, &actual) != nil {
+					return guardtx.ErrUnsupported
+				}
+				if len(actual) != len(retiredMetadata) {
+					return guardtx.ErrUnsupported
+				}
+				for key, expected := range retiredMetadata {
+					if string(actual[key]) != string(expected) {
+						return guardtx.ErrUnsupported
+					}
+				}
+				if _, exists := actual["krewe_claim_run"]; exists || updated.Status != "open" || updated.Assignee != "" {
+					return guardtx.ErrUnsupported
+				}
+				native.Issue = updated
+				commentID, err := addExactAuditComment(ctx, tx, r.Expected.IssueID, r.Actor, r.Effect.Comment)
+				if err != nil {
+					return err
+				}
+				write.Tables.Add("issues", "events", "comments")
+				nativeResult = struct {
+					issueops.ReleaseResult
+					CommentID           string `json:"commentId"`
+					RetiredClaimPointer string `json:"retiredClaimPointer"`
+				}{native, commentID, r.Effect.ClaimPointer}
+			} else if r.Effect.Kind == "release-with-comment" {
 				comment, err := storageissueops.AddIssueCommentInTx(ctx, tx, r.Expected.IssueID, r.Actor, r.Effect.Comment)
 				if err != nil {
 					return err
@@ -513,15 +559,20 @@ func applyHumanClearanceInTx(ctx context.Context, tx *sql.Tx, r guardops.Request
 	if err := json.Unmarshal([]byte(r.Effect.ClearanceValue), &clearance); err != nil {
 		return nil, err
 	}
+	eventDigest, err := auditHoldLabelEventIDsDigest(ctx, tx, r.Expected.IssueID)
+	if err != nil {
+		return nil, err
+	}
 	return struct {
-		IssueID         string `json:"issueId"`
-		Cleared         bool   `json:"cleared"`
-		MaterialVersion string `json:"materialVersion"`
-		HistoryComplete bool   `json:"historyComplete"`
-		RemovalEventID  string `json:"removalEventId"`
-		ClearanceKey    string `json:"clearanceKey"`
-		HistoryKey      string `json:"historyKey"`
-	}{r.Expected.IssueID, true, clearance.Value.MaterialVersion, false, removalEventID, r.Effect.ClearanceKey, r.Effect.HistoryKey}, nil
+		IssueID                  string `json:"issueId"`
+		Cleared                  bool   `json:"cleared"`
+		MaterialVersion          string `json:"materialVersion"`
+		HistoryComplete          bool   `json:"historyComplete"`
+		RemovalEventID           string `json:"removalEventId"`
+		ClearanceKey             string `json:"clearanceKey"`
+		HistoryKey               string `json:"historyKey"`
+		ClearLabelEventIDsDigest string `json:"clearLabelEventIdsDigest"`
+	}{r.Expected.IssueID, true, clearance.Value.MaterialVersion, false, removalEventID, r.Effect.ClearanceKey, r.Effect.HistoryKey, eventDigest}, nil
 }
 
 // Audit policy is deliberately separate from release/clearance primitives. An
@@ -815,18 +866,42 @@ func applyAuditHumanHoldInTx(ctx context.Context, tx *sql.Tx, r guardops.Request
 	if err := requireAbsentAuditRecords(ctx, tx, []guardops.AuditRecord{newRecord}); err != nil {
 		return nil, err
 	}
+	priorAdditions, err := auditHoldAdditionIDs(ctx, tx, r.Expected.IssueID)
+	if err != nil {
+		return nil, err
+	}
 	if err := storageissueops.AddLabelInTx(ctx, tx, "labels", "events", r.Expected.IssueID, "human-required", r.Actor); err != nil {
 		return nil, err
 	}
 	if err := appendAuditRecords(ctx, tx, []guardops.AuditRecord{newRecord}); err != nil {
 		return nil, err
 	}
-	return struct {
-		IssueID         string `json:"issueId"`
-		Held            bool   `json:"held"`
-		MaterialVersion string `json:"materialVersion"`
-		HistoryComplete bool   `json:"historyComplete"`
-	}{r.Expected.IssueID, true, r.Effect.MaterialVersion, false}, nil
+	additions, err := auditHoldAdditionIDs(ctx, tx, r.Expected.IssueID)
+	if err != nil {
+		return nil, err
+	}
+	holdEventID := ""
+	for id := range additions {
+		if !priorAdditions[id] {
+			if holdEventID != "" {
+				return nil, guardtx.ErrUnsupported
+			}
+			holdEventID = id
+		}
+	}
+	if holdEventID == "" || len(additions) != len(priorAdditions)+1 {
+		return nil, guardtx.ErrUnsupported
+	}
+	eventDigest, err := auditHoldLabelEventIDsDigest(ctx, tx, r.Expected.IssueID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"issueId": r.Expected.IssueID, "held": true, "materialVersion": r.Effect.MaterialVersion, "historyComplete": false,
+		"holdRecordKey": r.Effect.HoldRecordKey, "holdRecordValueDigest": guardops.RecordValueDigest(r.Effect.HoldRecordValue),
+		"heldAt": hold.Value.HeldAt, "guardGeneration": r.Expected.Generation, "originalToken": r.Expected.Token,
+		"clearanceNamespace": r.Effect.ClearanceNamespace, "clearanceContentDigest": r.Effect.ClearanceContentDigest, "holdEventId": holdEventID, "holdLabelEventIdsDigest": eventDigest,
+	}, nil
 }
 
 func verifyAuditClearanceProvenance(ctx context.Context, tx *sql.Tx, r guardops.Request, hold guardops.AuditHoldEnvelope, latestKey string) error {
@@ -866,13 +941,14 @@ func verifyAuditClearanceProvenance(ctx context.Context, tx *sql.Tx, r guardops.
 		}
 		var saved guardops.Result
 		var result struct {
-			IssueID         string `json:"issueId"`
-			Cleared         bool   `json:"cleared"`
-			MaterialVersion string `json:"materialVersion"`
-			HistoryComplete *bool  `json:"historyComplete"`
-			RemovalEventID  string `json:"removalEventId"`
-			ClearanceKey    string `json:"clearanceKey"`
-			HistoryKey      string `json:"historyKey"`
+			IssueID                  string `json:"issueId"`
+			Cleared                  bool   `json:"cleared"`
+			MaterialVersion          string `json:"materialVersion"`
+			HistoryComplete          *bool  `json:"historyComplete"`
+			RemovalEventID           string `json:"removalEventId"`
+			ClearanceKey             string `json:"clearanceKey"`
+			HistoryKey               string `json:"historyKey"`
+			ClearLabelEventIDsDigest string `json:"clearLabelEventIdsDigest"`
 		}
 		if json.Unmarshal([]byte(raw), &saved) != nil || saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.OperationID != h.Value.OperationID || json.Unmarshal([]byte(saved.ResultJSON), &result) != nil || result.IssueID != r.Expected.IssueID || !result.Cleared || result.HistoryComplete == nil || *result.HistoryComplete || result.MaterialVersion != h.Value.Clearance.MaterialVersion || result.RemovalEventID == "" || result.HistoryKey != record.Key || h.Value.GuardGeneration != r.Expected.Generation {
 			return fmt.Errorf("%w: legacy or unlinked native clearance result", guardtx.ErrUnsupported)
@@ -893,7 +969,17 @@ func verifyAuditClearanceProvenance(ctx context.Context, tx *sql.Tx, r guardops.
 			return fmt.Errorf("%w: ambiguous native clearance event linkage", guardtx.ErrUnsupported)
 		}
 		linked[result.RemovalEventID] = true
+		if !validStoredEventDigest(result.ClearLabelEventIDsDigest) {
+			return fmt.Errorf("%w: unbound native clearance event set", guardtx.ErrUnsupported)
+		}
 		if result.ClearanceKey == latestKey {
+			currentDigest, err := auditHoldLabelEventIDsDigest(ctx, tx, r.Expected.IssueID)
+			if err != nil {
+				return err
+			}
+			if result.ClearLabelEventIDsDigest != currentDigest {
+				return fmt.Errorf("%w: later native or manual hold label event", guardtx.ErrUnsupported)
+			}
 			latestLinked = true
 		}
 	}
@@ -910,4 +996,245 @@ func verifyAuditClearanceProvenance(ctx context.Context, tx *sql.Tx, r guardops.
 		}
 	}
 	return nil
+}
+
+func (s *DoltStore) GuardedRecordAttester() (guardops.RecordAttester, error) {
+	if s == nil {
+		return nil, guardtx.ErrUnsupported
+	}
+	return &guardedMutator{store: s}, nil
+}
+
+func auditHoldAdditionIDs(ctx context.Context, tx *sql.Tx, id string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM events WHERE issue_id=? AND event_type='label_added' AND CAST(comment AS BINARY)=CAST('Added label: human-required' AS BINARY)", id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := map[string]bool{}
+	for rows.Next() {
+		var eventID string
+		if err := rows.Scan(&eventID); err != nil {
+			return nil, err
+		}
+		if !nativeEventID(eventID) {
+			return nil, guardtx.ErrUnsupported
+		}
+		ids[eventID] = true
+	}
+	return ids, rows.Err()
+}
+func nativeEventID(id string) bool {
+	if parsed, err := uuid.Parse(id); err == nil && parsed.String() == id && parsed != uuid.Nil {
+		return true
+	}
+	if id == "" || id[0] == '0' {
+		return false
+	}
+	for _, ch := range id {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	_, err := strconv.ParseInt(id, 10, 64)
+	return err == nil
+}
+
+// Attestation authenticates a currently captured immutable record against a
+// durable native operation and its actual event. It grants no complete-history
+// or current-episode inference; callers must account for later captured events.
+func (g *guardedMutator) AttestRecord(ctx context.Context, r guardops.RecordAttestationRequest) (guardops.RecordAttestationResult, error) {
+	result := guardops.RecordAttestationResult{Protocol: guardops.Protocol, RecordKey: r.RecordKey, RecordValueDigest: guardops.RecordValueDigest(r.RecordValue), Outcome: "unknown"}
+	if err := guardops.ValidateRecordAttestation(r); err != nil {
+		return result, err
+	}
+	err := g.withGuardReadTx(ctx, func(tx *sql.Tx) error {
+		current, err := captureGuardState(ctx, tx, r.Expected.IssueID)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(current, r.Expected) {
+			result.Outcome = "conflict"
+			result.Reason = "current native capture differs"
+			return nil
+		}
+		var value string
+		if err := tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key`=?", "kv."+r.RecordKey).Scan(&value); err != nil {
+			return err
+		}
+		if value != r.RecordValue {
+			return guardtx.ErrUnsupported
+		}
+		rows, err := tx.QueryContext(ctx, "SELECT operation_id,request_digest,result_json FROM bd_guard_operations ORDER BY operation_id")
+		if err != nil {
+			return err
+		}
+		// Close the cursor before reading config/events on this single native session.
+		type entry struct{ id, digest, raw string }
+		entries := []entry{}
+		for rows.Next() {
+			var e entry
+			if err := rows.Scan(&e.id, &e.digest, &e.raw); err != nil {
+				rows.Close()
+				return err
+			}
+			entries = append(entries, e)
+		}
+		rowErr := rows.Err()
+		rows.Close()
+		if rowErr != nil {
+			return rowErr
+		}
+		var identified *guardops.Result
+		for _, e := range entries {
+			var saved guardops.Result
+			if json.Unmarshal([]byte(e.raw), &saved) != nil || saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.OperationID != e.id || saved.RequestDigest != e.digest || guardops.ValidateLookup(guardops.LookupRequest{Protocol: guardops.Protocol, OperationID: e.id, RequestDigest: e.digest}) != nil {
+				continue
+			}
+			linked, err := attestNativeAuditRecord(ctx, tx, r, saved)
+			if err != nil {
+				return err
+			}
+			if linked {
+				if identified != nil {
+					return guardtx.ErrUnsupported
+				}
+				copy := saved
+				identified = &copy
+			}
+		}
+		if identified != nil {
+			result.Outcome = "identified"
+			result.Operation = identified
+		} else {
+			result.Reason = "record lacks exact native ledger and event binding"
+		}
+		return nil
+	})
+	if err != nil {
+		result.Outcome = "unknown"
+		result.Operation = nil
+		result.Reason = err.Error()
+	}
+	return result, err
+}
+
+func attestNativeAuditRecord(ctx context.Context, tx *sql.Tx, r guardops.RecordAttestationRequest, saved guardops.Result) (bool, error) {
+	var body struct {
+		IssueID                  string `json:"issueId"`
+		Held                     bool   `json:"held"`
+		Cleared                  bool   `json:"cleared"`
+		MaterialVersion          string `json:"materialVersion"`
+		HistoryComplete          *bool  `json:"historyComplete"`
+		HoldRecordKey            string `json:"holdRecordKey"`
+		HoldRecordValueDigest    string `json:"holdRecordValueDigest"`
+		HeldAt                   string `json:"heldAt"`
+		GuardGeneration          string `json:"guardGeneration"`
+		OriginalToken            string `json:"originalToken"`
+		ClearanceNamespace       string `json:"clearanceNamespace"`
+		ClearanceContentDigest   string `json:"clearanceContentDigest"`
+		HoldEventID              string `json:"holdEventId"`
+		HoldLabelEventIDsDigest  string `json:"holdLabelEventIdsDigest"`
+		ClearanceKey             string `json:"clearanceKey"`
+		HistoryKey               string `json:"historyKey"`
+		ClearLabelEventIDsDigest string `json:"clearLabelEventIdsDigest"`
+		RemovalEventID           string `json:"removalEventId"`
+	}
+	if json.Unmarshal([]byte(saved.ResultJSON), &body) != nil || body.IssueID != r.Expected.IssueID || body.HistoryComplete == nil || *body.HistoryComplete {
+		return false, nil
+	}
+	var actor, eventID, eventType, eventComment string
+	if body.Held && !body.Cleared && body.HoldRecordKey == r.RecordKey && body.HoldRecordValueDigest == guardops.RecordValueDigest(r.RecordValue) {
+		var h guardops.AuditHoldEnvelope
+		if json.Unmarshal([]byte(r.RecordValue), &h) != nil {
+			return false, nil
+		}
+		proof := guardops.Request{OperationID: saved.OperationID, Actor: h.Value.Actor, Expected: guardops.Snapshot{Generation: r.Expected.Generation, Token: body.OriginalToken}, Effect: guardops.Effect{Kind: "add-human-hold", MaterialVersion: body.MaterialVersion, ClearanceNamespace: body.ClearanceNamespace, ClearanceContentDigest: body.ClearanceContentDigest, HoldRecordKey: r.RecordKey, HoldRecordValue: r.RecordValue}}
+		parsed, err := guardops.DecodeAuditHoldRecord(proof)
+		if err != nil || body.GuardGeneration != r.Expected.Generation || body.HeldAt != parsed.Value.HeldAt || !nativeEventID(body.HoldEventID) {
+			return false, nil
+		}
+		// Historical authenticity survives later native clears. Current-episode
+		// consumers separately compare this stored event-set digest with their
+		// current captured image; the reader never grants active hold age.
+		if !validStoredEventDigest(body.HoldLabelEventIDsDigest) {
+			return false, nil
+		}
+		actor = parsed.Value.Actor
+		eventID = body.HoldEventID
+		eventType = "label_added"
+		eventComment = "Added label: human-required"
+	} else if body.Cleared && !body.Held && (body.ClearanceKey == r.RecordKey || body.HistoryKey == r.RecordKey) {
+		var historyRaw, clearanceRaw string
+		if err := tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key`=?", "kv."+body.HistoryKey).Scan(&historyRaw); err != nil {
+			return false, err
+		}
+		if err := tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key`=?", "kv."+body.ClearanceKey).Scan(&clearanceRaw); err != nil {
+			return false, err
+		}
+		var namespaces struct {
+			Namespace string `json:"namespace"`
+		}
+		if json.Unmarshal([]byte(historyRaw), &namespaces) != nil {
+			return false, nil
+		}
+		h, err := guardops.ParseAuditClearanceHistory(body.HistoryKey, historyRaw, namespaces.Namespace)
+		if !validStoredEventDigest(body.ClearLabelEventIDsDigest) || err != nil || h.Value.OperationID != saved.OperationID || h.Value.GuardGeneration != r.Expected.Generation || body.MaterialVersion != h.Value.Clearance.MaterialVersion || !nativeEventID(body.RemovalEventID) {
+			return false, nil
+		}
+		if json.Unmarshal([]byte(clearanceRaw), &namespaces) != nil {
+			return false, nil
+		}
+		c, err := guardops.ParseAuditClearance(body.ClearanceKey, clearanceRaw, namespaces.Namespace)
+		if err != nil || c != h.Value.Clearance {
+			return false, nil
+		}
+		actor = c.ClearedBy
+		eventID = body.RemovalEventID
+		eventType = "label_removed"
+		eventComment = "Removed label: human-required"
+	} else {
+		return false, nil
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE id=? AND issue_id=? AND event_type=? AND CAST(actor AS BINARY)=CAST(? AS BINARY) AND CAST(comment AS BINARY)=CAST(? AS BINARY)", eventID, r.Expected.IssueID, eventType, actor, eventComment).Scan(&count); err != nil {
+		return false, err
+	}
+	return count == 1, nil
+}
+
+// Native events are immutable runtime facts. Comparing the complete target
+// label-event set proves no subsequent ordinary clear/readd even when UUID IDs
+// and second-precision timestamps carry no total causal ordering.
+func auditHoldLabelEventIDsDigest(ctx context.Context, tx *sql.Tx, id string) (string, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM events WHERE issue_id=? AND ((event_type='label_added' AND CAST(comment AS BINARY)=CAST('Added label: human-required' AS BINARY)) OR (event_type='label_removed' AND CAST(comment AS BINARY)=CAST('Removed label: human-required' AS BINARY)))", id)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var eventID string
+		if err := rows.Scan(&eventID); err != nil {
+			return "", err
+		}
+		if !nativeEventID(eventID) {
+			return "", guardtx.ErrUnsupported
+		}
+		ids = append(ids, eventID)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	sort.Strings(ids)
+	raw, err := json.Marshal(ids)
+	if err != nil {
+		return "", err
+	}
+	return guardops.RecordValueDigest(string(raw)), nil
+}
+
+func validStoredEventDigest(digest string) bool {
+	b, err := hex.DecodeString(digest)
+	return err == nil && len(b) == 32 && strings.ToLower(digest) == digest
 }

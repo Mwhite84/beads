@@ -35,6 +35,7 @@ type Snapshot struct {
 
 type Effect struct {
 	Kind                   string `json:"kind"`
+	ClaimPointer           string `json:"claimPointer,omitempty"`
 	Comment                string `json:"comment,omitempty"`
 	ClearanceKey           string `json:"clearanceKey,omitempty"`
 	ClearanceValue         string `json:"clearanceValue,omitempty"`
@@ -93,7 +94,9 @@ func Digest(r Request) string {
 	fields := []string{r.Protocol, r.OperationID, r.Actor, e.Protocol,
 		e.IssueID, e.Database, e.Branch, e.Head, e.Root, e.Generation, e.Token,
 		e.StateJSON, r.Effect.Kind}
-	if r.Effect.Kind == "release-with-comment" || r.Effect.Kind == "audit-comment" {
+	if r.Effect.Kind == "release-retire-pointer" {
+		fields = append(fields, r.Effect.ClaimPointer, r.Effect.Comment)
+	} else if r.Effect.Kind == "release-with-comment" || r.Effect.Kind == "audit-comment" {
 		fields = append(fields, r.Effect.Comment)
 	} else if r.Effect.Kind == "clear-human-hold" {
 		fields = append(fields, r.Effect.ClearanceKey, r.Effect.ClearanceValue, r.Effect.HistoryKey, r.Effect.HistoryValue)
@@ -143,7 +146,17 @@ func ValidateRequest(r Request) error {
 		!utf8.ValidString(r.Actor) || !utf8.ValidString(r.ContextJSON) {
 		return ErrValidation
 	}
+	if r.Effect.Kind != "release-retire-pointer" && r.Effect.ClaimPointer != "" {
+		return ErrValidation
+	}
 	switch r.Effect.Kind {
+	case "release-retire-pointer":
+		if hasAuditFields(r.Effect) || hasClearanceFields(r.Effect) || len(r.Actor) > 255 {
+			return ErrValidation
+		}
+		if err := validateRetirePointer(r.Effect); err != nil {
+			return err
+		}
 	case "release":
 		if r.Effect.Comment != "" || hasClearanceFields(r.Effect) || hasAuditFields(r.Effect) {
 			return ErrValidation

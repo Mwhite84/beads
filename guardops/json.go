@@ -56,7 +56,10 @@ func decodeExact(raw []byte, target any) error {
 			return fmt.Errorf("%w: invalid effect shape", ErrValidation)
 		}
 		effectShape := wireShape{"kind": nil}
-		if discriminator.Effect.Kind == "release-with-comment" || discriminator.Effect.Kind == "audit-comment" {
+		if discriminator.Effect.Kind == "release-retire-pointer" {
+			effectShape["claimPointer"] = nil
+			effectShape["comment"] = nil
+		} else if discriminator.Effect.Kind == "release-with-comment" || discriminator.Effect.Kind == "audit-comment" {
 			effectShape["comment"] = nil
 		} else if discriminator.Effect.Kind == "clear-human-hold" {
 			for _, key := range []string{"clearanceKey", "clearanceValue", "historyKey", "historyValue"} {
@@ -79,6 +82,8 @@ func decodeExact(raw []byte, target any) error {
 				"head": nil, "root": nil, "generation": nil, "token": nil, "stateJson": nil},
 			"effect": effectShape,
 		}
+	case *RecordAttestationRequest:
+		shape = wireShape{"protocol": nil, "recordKey": nil, "recordValue": nil, "expected": {"protocol": nil, "issueId": nil, "database": nil, "branch": nil, "head": nil, "root": nil, "generation": nil, "token": nil, "stateJson": nil}}
 	case *LookupRequest:
 		shape = wireShape{"protocol": nil, "operationId": nil, "requestDigest": nil}
 	default:
