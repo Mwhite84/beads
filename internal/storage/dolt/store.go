@@ -45,6 +45,7 @@ import (
 	"github.com/steveyegge/beads/internal/gittraceenv"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/kvkeys"
 	"github.com/steveyegge/beads/internal/storage/schema"
@@ -1232,18 +1233,19 @@ func (s *DoltStore) commitWriteTx(ctx context.Context, fn func(tx *sql.Tx) error
 	if s.closed.Load() {
 		return issueops.BlockedRecheck{}, ErrStoreClosed
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := guardtx.BeginTx(ctx, s.db, nil)
 	if err != nil {
 		return issueops.BlockedRecheck{}, fmt.Errorf("begin write tx: %w", err)
 	}
+	defer guardtx.Forget(tx)
 	clearJournalScope := s.scopeEventsJournalTransaction(tx)
 	defer clearJournalScope()
 	clearRecheckScope := issueops.ScopeBlockedRecheckTransaction(tx)
 	defer clearRecheckScope()
 	if err := fn(tx); err != nil {
-		return issueops.BlockedRecheck{}, errors.Join(err, tx.Rollback())
+		return issueops.BlockedRecheck{}, errors.Join(err, guardtx.Rollback(tx))
 	}
-	if err := tx.Commit(); err != nil {
+	if err := guardtx.Commit(ctx, tx); err != nil {
 		return issueops.BlockedRecheck{}, wrapSQLCommitError("commit write tx", err)
 	}
 	return issueops.TakeBlockedRecheck(tx), nil
@@ -1308,7 +1310,7 @@ func (s *DoltStore) scopeEventsJournalTransaction(tx *sql.Tx) func() {
 }
 
 func (s *DoltStore) commitSQLTx(ctx context.Context, op string, tx *sql.Tx) error {
-	if err := tx.Commit(); err != nil {
+	if err := guardtx.Commit(ctx, tx); err != nil {
 		return s.recordDoltPublicationFailure(ctx, wrapSQLCommitError(op, err))
 	}
 	return nil
@@ -1329,17 +1331,17 @@ func (s *DoltStore) execContext(ctx context.Context, query string, args ...any) 
 	)
 	var result sql.Result
 	err := s.withRetry(ctx, func() error {
-		tx, txErr := s.db.BeginTx(ctx, nil)
+		tx, txErr := guardtx.BeginTx(ctx, s.db, nil)
 		if txErr != nil {
 			return txErr
 		}
 		var execErr error
 		result, execErr = tx.ExecContext(ctx, query, args...)
 		if execErr != nil {
-			_ = tx.Rollback()
+			_ = guardtx.Rollback(tx)
 			return execErr
 		}
-		if commitErr := tx.Commit(); commitErr != nil {
+		if commitErr := guardtx.Commit(ctx, tx); commitErr != nil {
 			return wrapSQLCommitError("commit exec tx", commitErr)
 		}
 		return nil
@@ -2373,6 +2375,8 @@ func buildServerDSN(cfg *Config, database string) string {
 // fetch writes only remote-tracking refs, never the working branch. Neither
 // depends on this fresh connection's default checkout.
 func (s *DoltStore) execWithLongTimeout(ctx context.Context, query string, args ...any) error {
+	// Native guard MVP exclusion: pull/merge root operations require a drained maintenance
+	// window and invalidated audit expectations; this path is not a guarded runtime writer.
 	cfg, err := mysql.ParseDSN(s.connStr)
 	if err != nil {
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
@@ -3361,6 +3365,9 @@ func (s *DoltStore) commitWorkingSet(ctx context.Context, message string, mode c
 		return fmt.Errorf("failed to acquire connection: %w", err)
 	}
 	defer conn.Close()
+	if err := guardtx.Prepare(ctx, conn); err != nil {
+		return err
+	}
 
 	// GH#2455: stage each dirty table individually, skipping config unless the
 	// mode opts it in, to avoid sweeping up stale issue_prefix changes from
@@ -3373,7 +3380,7 @@ func (s *DoltStore) commitWorkingSet(ctx context.Context, message string, mode c
 	// keeps ordinary commits from failing whenever an ignored table is dirty.
 	rows, err := conn.QueryContext(ctx, `
 		SELECT s.table_name FROM dolt_status s
-		WHERE NOT EXISTS (
+		WHERE s.table_name <> 'bd_guard_state' AND NOT EXISTS (
 			SELECT 1 FROM dolt_ignore di
 			WHERE di.ignored = 1
 			AND s.table_name LIKE di.pattern
@@ -3431,6 +3438,16 @@ func (s *DoltStore) commitWorkingSet(ctx context.Context, message string, mode c
 		if err := schema.DrainCall(ctx, conn, "CALL DOLT_ADD(?)", table); err != nil {
 			return fmt.Errorf("failed to stage %s before commit: %w", table, err)
 		}
+	}
+	staged, err := issueops.HasStagedChanges(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if !staged {
+		return nil
+	}
+	if err := guardtx.Stage(ctx, conn); err != nil {
+		return err
 	}
 
 	// NOTE: In SQL procedure mode, Dolt defaults author to the authenticated SQL user
@@ -3536,6 +3553,19 @@ func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error 
 			return fmt.Errorf("failed to acquire connection: %w", err)
 		}
 		defer conn.Close()
+		if err := guardtx.Prepare(ctx, conn); err != nil {
+			return err
+		}
+		pending, err := issueops.HasPendingChanges(ctx, conn)
+		if err != nil {
+			return err
+		}
+		if !pending {
+			return nil
+		}
+		if err := guardtx.Stage(ctx, conn); err != nil {
+			return err
+		}
 
 		if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)", message, s.commitAuthorString()); err != nil {
 			if isDoltNothingToCommit(err) {
@@ -3578,6 +3608,28 @@ func (s *DoltStore) CommitAll(ctx context.Context, message string) (bool, error)
 		}
 		defer conn.Close()
 
+		if err := guardtx.Prepare(ctx, conn); err != nil {
+			return err
+		}
+		// Preserve the native explicit-commit path on ordinary databases. A
+		// guarded database's coordination token alone is not a history effect.
+		enabled, err := guardtx.Enabled(ctx, conn)
+		if err != nil {
+			return err
+		}
+		if enabled {
+			pending, err := issueops.HasPendingChanges(ctx, conn)
+			if err != nil {
+				return err
+			}
+			if !pending {
+				return nil
+			}
+		}
+		if err := guardtx.Stage(ctx, conn); err != nil {
+			return err
+		}
+
 		if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)", message, s.commitAuthorString()); err != nil {
 			if isDoltNothingToCommit(err) {
 				return nil
@@ -3609,6 +3661,9 @@ func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commi
 				fmt.Errorf("acquire connection after SQL mutation: %w: %w", err, ErrCommitIndeterminate))
 		}
 		defer conn.Close()
+		if err := guardtx.Prepare(ctx, conn); err != nil {
+			return err
+		}
 
 		for _, table := range tables {
 			if err := schema.DrainCall(ctx, conn, "CALL DOLT_ADD(?)", table); err != nil {
@@ -3630,6 +3685,9 @@ func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commi
 		}
 		if !staged {
 			return nil
+		}
+		if err := guardtx.Stage(ctx, conn); err != nil {
+			return err
 		}
 
 		if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
@@ -4671,6 +4729,8 @@ func (s *DoltStore) pullWithAutoResolveReporting(ctx context.Context, remote str
 }
 
 func (s *DoltStore) pullWithAutoResolveUnchecked(ctx context.Context, remote string, query string, args ...any) (pullReport, error) {
+	// Pull/conflict maintenance is outside the guarded runtime boundary; drain
+	// audits and invalidate their expectations before this operation.
 	// Audited for be-b0am's fresh-connection branch hazard: NOT safe, and all
 	// three callers share it. Passing a branch argument does not avoid it.
 	//
@@ -4916,7 +4976,7 @@ type txBeginner interface {
 }
 
 func (s *DoltStore) recomputeAllBlockedWithDB(ctx context.Context, db txBeginner) (int, error) {
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := guardtx.BeginTx(ctx, db, nil)
 	if err != nil {
 		return 0, fmt.Errorf("begin is_blocked recompute: %w", err)
 	}
@@ -4926,7 +4986,7 @@ func (s *DoltStore) recomputeAllBlockedWithDB(ctx context.Context, db txBeginner
 	// working set the recompute reads (bd-6dnrw.37).
 	changed, err := versioncontrolops.GuardedRecomputeAllBlockedInTx(ctx, tx)
 	if err != nil {
-		_ = tx.Rollback()
+		_ = guardtx.Rollback(tx)
 		return 0, err
 	}
 	if err := s.commitSQLTx(ctx, "commit is_blocked recompute", tx); err != nil {
@@ -4983,12 +5043,12 @@ func (s *DoltStore) recomputeBlockedTx(ctx context.Context, fromCommit string) e
 }
 
 func (s *DoltStore) recomputeBlockedTxWithDB(ctx context.Context, db txBeginner, fromCommit string) error {
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := guardtx.BeginTx(ctx, db, nil)
 	if err != nil {
 		return fmt.Errorf("begin is_blocked recompute: %w", err)
 	}
 	if err := issueops.RecomputeIsBlockedAfterMergeInTx(ctx, tx, fromCommit); err != nil {
-		_ = tx.Rollback()
+		_ = guardtx.Rollback(tx)
 		return err
 	}
 	if err := s.commitSQLTx(ctx, "commit is_blocked recompute", tx); err != nil {
@@ -5001,15 +5061,15 @@ func (s *DoltStore) recomputeBlockedTxWithDB(ctx context.Context, db txBeginner,
 // is_blocked recompute (bd-578h9.11); see
 // issueops.MarkIsBlockedRecomputePendingInTx.
 func (s *DoltStore) markBlockedRecomputePending(ctx context.Context, fromCommit string) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := guardtx.BeginTx(ctx, s.db, nil)
 	if err != nil {
 		return
 	}
 	if err := issueops.MarkIsBlockedRecomputePendingInTx(ctx, tx, fromCommit); err != nil {
-		_ = tx.Rollback()
+		_ = guardtx.Rollback(tx)
 		return
 	}
-	_ = tx.Commit()
+	_ = guardtx.Commit(ctx, tx)
 }
 
 // finishCLIPull runs the merge-conflict auto-resolver after a CLI-based pull
@@ -5054,6 +5114,8 @@ func (s *DoltStore) finishCLIPull(ctx context.Context, pullErr error) error {
 // resolved and committed; (false, nil) when there is nothing to resolve or a conflict
 // needs the operator, leaving the working set untouched for manual resolution.
 func (s *DoltStore) autoResolveConflictsAfterCLIPull(ctx context.Context) (bool, error) {
+	// A CLI pull already changed the root outside guardtx. Repair is maintenance, not proof
+	// that routine concurrent sync participates in the guarded-writer protocol.
 	// Pin a single connection: @@dolt_allow_commit_conflicts is session-scoped,
 	// and setting it through a pooled transaction leaks it to whichever caller
 	// drains that connection next. Reset it before releasing the connection; if

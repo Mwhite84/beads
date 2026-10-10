@@ -1,0 +1,131 @@
+// Package guardops declares the optional full-state guarded mutation role.
+// It carries issue primitives; orchestration eligibility remains caller policy.
+package guardops
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"strings"
+	"unicode/utf8"
+)
+
+const Protocol = "beads.guard.v1"
+const MaxStateBytes = 16 << 20
+const MaxContextBytes = 1 << 20
+
+type Snapshot struct {
+	Protocol string `json:"protocol"`
+	IssueID  string `json:"issueId"`
+	Database string `json:"database"`
+	Branch   string `json:"branch"`
+	Head     string `json:"head"`
+	// Root is the versioned working-root plus relevant lease-table hash.
+	Root       string `json:"root"`
+	Generation string `json:"generation"`
+	Token      string `json:"token"`
+	// StateJSON preserves exact server serialization, including int64 fields.
+	// Callers must not parse and recompose it before guarded application.
+	StateJSON string `json:"stateJson"`
+}
+
+type Effect struct {
+	Kind string `json:"kind"`
+}
+type Request struct {
+	Protocol    string   `json:"protocol"`
+	OperationID string   `json:"operationId"`
+	Actor       string   `json:"actor"`
+	Expected    Snapshot `json:"expected"`
+	Effect      Effect   `json:"effect"`
+	ContextJSON string   `json:"contextJson"`
+}
+type LookupRequest struct {
+	Protocol      string `json:"protocol"`
+	OperationID   string `json:"operationId"`
+	RequestDigest string `json:"requestDigest"`
+}
+type Result struct {
+	Protocol      string `json:"protocol"`
+	OperationID   string `json:"operationId"`
+	RequestDigest string `json:"requestDigest"`
+	Outcome       string `json:"outcome"`
+	Reason        string `json:"reason,omitempty"`
+	ResultJSON    string `json:"resultJson,omitempty"`
+	// Replayed is local completion-hook bookkeeping, not a wire assertion.
+	Replayed bool `json:"-"`
+}
+
+// Mutator is a separate optional capability. Do not append it to Lifecycle
+// or Releaser: consumers of those stable roles did not request this contract.
+type Mutator interface {
+	Capture(context.Context, string) (Snapshot, error)
+	Apply(context.Context, Request) (Result, error)
+	Lookup(context.Context, LookupRequest) (Result, error)
+}
+
+// Provider exposes the optional role without widening existing storage roles.
+type Provider interface {
+	GuardedMutator() (Mutator, error)
+}
+
+var ErrValidation = errors.New("guard: invalid request")
+
+func Digest(r Request) string {
+	e := r.Expected
+	return digestStrings([]string{r.Protocol, r.OperationID, r.Actor, e.Protocol,
+		e.IssueID, e.Database, e.Branch, e.Head, e.Root, e.Generation, e.Token,
+		e.StateJSON, r.Effect.Kind, r.ContextJSON})
+}
+
+func SnapshotDigest(e Snapshot) string {
+	return digestStrings([]string{e.Protocol, e.IssueID, e.Database, e.Branch,
+		e.Head, e.Root, e.Generation, e.Token, e.StateJSON})
+}
+
+func digestStrings(fields []string) string {
+	h := sha256.New()
+	var length [8]byte
+	for _, s := range fields {
+		binary.BigEndian.PutUint64(length[:], uint64(len([]byte(s))))
+		h.Write(length[:])
+		h.Write([]byte(s))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func ValidateSnapshot(s Snapshot) error {
+	if s.Protocol != Protocol || len(s.StateJSON) > MaxStateBytes {
+		return ErrValidation
+	}
+	for _, v := range []string{s.IssueID, s.Database, s.Branch, s.Head, s.Root, s.Generation, s.Token, s.StateJSON} {
+		if strings.TrimSpace(v) == "" || !utf8.ValidString(v) {
+			return ErrValidation
+		}
+	}
+	return nil
+}
+
+func ValidateRequest(r Request) error {
+	if r.Protocol != Protocol || r.Effect.Kind != "release" ||
+		strings.TrimSpace(r.OperationID) == "" || len(r.OperationID) > 128 ||
+		strings.TrimSpace(r.Actor) == "" || len(r.Actor) > 256 || len(r.ContextJSON) > MaxContextBytes ||
+		strings.TrimSpace(r.ContextJSON) == "" || !utf8.ValidString(r.OperationID) ||
+		!utf8.ValidString(r.Actor) || !utf8.ValidString(r.ContextJSON) {
+		return ErrValidation
+	}
+	return ValidateSnapshot(r.Expected)
+}
+
+func ValidateLookup(r LookupRequest) error {
+	if r.Protocol != Protocol || strings.TrimSpace(r.OperationID) == "" || len(r.OperationID) > 128 || !utf8.ValidString(r.OperationID) {
+		return ErrValidation
+	}
+	b, err := hex.DecodeString(r.RequestDigest)
+	if err != nil || len(b) != 32 || strings.ToLower(r.RequestDigest) != r.RequestDigest {
+		return ErrValidation
+	}
+	return nil
+}

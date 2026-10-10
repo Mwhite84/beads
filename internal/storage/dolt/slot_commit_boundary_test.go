@@ -66,6 +66,8 @@ func (c *slotCommitBoundaryConn) QueryContext(_ context.Context, query string, _
 	defer c.driver.mu.Unlock()
 
 	switch {
+	case isOrdinaryGuardCapabilityProbe(query):
+		return &claimCommitBoundaryRows{columns: []string{"count"}, values: [][]driver.Value{{int64(0)}}}, nil
 	case strings.Contains(query, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1"):
 		if c.driver.activeWisp {
 			return &claimCommitBoundaryRows{columns: []string{"exists"}, values: [][]driver.Value{{int64(1)}}}, nil
@@ -94,7 +96,7 @@ func (c *slotCommitBoundaryConn) QueryContext(_ context.Context, query string, _
 		return &claimCommitBoundaryRows{columns: []string{"label"}}, nil
 	case strings.Contains(query, "SELECT id FROM events"), strings.Contains(query, "SELECT id FROM wisp_events"):
 		return &claimCommitBoundaryRows{columns: []string{"id"}}, nil
-	case strings.Contains(query, "FROM dolt_status"):
+	case isOrdinaryNativeCommitCountQuery(query):
 		// Empty-commit guard (GH#4288 re-port): report one staged row so the
 		// commit paths under test still reach DOLT_COMMIT.
 		return &claimCommitBoundaryRows{columns: []string{"count"}, values: [][]driver.Value{{int64(1)}}}, nil

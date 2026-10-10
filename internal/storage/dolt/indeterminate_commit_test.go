@@ -45,6 +45,15 @@ func (c *failureConn) ExecContext(context.Context, string, []driver.NamedValue) 
 	c.driver.execs.Add(1)
 	return driver.RowsAffected(1), nil
 }
+
+// Capability lookup is setup, not a mutation or a prepared-statement failure.
+// Every other query keeps the original driver's prepared fallback/error path.
+func (c *failureConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	if isOrdinaryGuardCapabilityProbe(query) {
+		return &valRows{cols: []string{"count"}, vals: [][]driver.Value{{int64(0)}}}, nil
+	}
+	return nil, driver.ErrSkip
+}
 func (c *failureConn) Begin() (driver.Tx, error) {
 	c.driver.begins.Add(1)
 	if c.driver.failBegin.Load() > 0 {
@@ -77,6 +86,7 @@ func (d *failureDriver) nextCommitError() error {
 
 var _ driver.Connector = (*failureDriver)(nil)
 var _ driver.ExecerContext = (*failureConn)(nil)
+var _ driver.QueryerContext = (*failureConn)(nil)
 
 func newFailureStore(d *failureDriver) *DoltStore {
 	return &DoltStore{db: sql.OpenDB(d)}

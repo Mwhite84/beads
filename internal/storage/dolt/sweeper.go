@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	storeops "github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/workapi"
@@ -73,8 +74,21 @@ func (s *sweeper) Sweep(ctx context.Context, req issueops.SweepRequest) (issueop
 		if result.Swept == 0 {
 			return nil
 		}
+		if err := guardtx.Prepare(ctx, tx); err != nil {
+			return err
+		}
 		for _, table := range sweptTables {
 			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
+		}
+		staged, err := storeops.HasStagedChanges(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !staged {
+			return nil
+		}
+		if err := guardtx.Stage(ctx, tx); err != nil {
+			return err
 		}
 		msg := fmt.Sprintf("bd: sweep %d %s bead(s)", result.Swept, req.Tier)
 		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",

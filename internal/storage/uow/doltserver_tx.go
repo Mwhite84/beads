@@ -7,6 +7,7 @@ import (
 	"errors"
 
 	"github.com/steveyegge/beads/internal/storage/domain/db"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 )
 
@@ -50,6 +51,7 @@ func (t *doltServerTx) Commit(ctx context.Context, message string) error {
 	_, err = t.conn.ExecContext(ctx, stmt, args...)
 	if err == nil {
 		t.done = true
+		guardtx.Forget(t.conn)
 		// The write is durable. Settle the dependents its unblocking writes
 		// recorded on a fresh snapshot before the pinned session goes back
 		// to the pool (gastownhall/beads#6716). A recheck failure is logged,
@@ -79,6 +81,9 @@ func (t *doltServerTx) Commit(ctx context.Context, message string) error {
 // commitStatement picks the statement that ends the open transaction on the
 // pinned session for a commit named message.
 func (t *doltServerTx) commitStatement(ctx context.Context, message string) (string, []interface{}, error) {
+	if err := guardtx.Prepare(ctx, t.conn); err != nil {
+		return "", nil, err
+	}
 	// dolt.auto-commit=batch/off (GH#4995): defer the Dolt version commit to a
 	// later explicit commit point (bd dolt commit), the same as the embedded
 	// and direct SQL-server backends already do at their own commit sites
@@ -141,6 +146,8 @@ func (t *doltServerTx) commitStatement(ctx context.Context, message string) (str
 		}
 		if !pending {
 			stmt, args = "COMMIT;", nil
+		} else if err := guardtx.Stage(ctx, t.conn); err != nil {
+			return "", nil, err
 		}
 	}
 	return stmt, args, nil
@@ -195,6 +202,7 @@ func (t *doltServerTx) releaseConn() {
 	t.releaseJournalScope()
 	t.releaseRecheckScope()
 	if t.conn != nil {
+		guardtx.Forget(t.conn)
 		_ = t.conn.Close()
 		t.conn = nil
 	}
@@ -231,6 +239,7 @@ func (t *doltServerTx) poisonConn() {
 	if t.conn == nil {
 		return
 	}
+	guardtx.Forget(t.conn)
 	_ = t.conn.Raw(func(any) error { return driver.ErrBadConn })
 	_ = t.conn.Close()
 	t.conn = nil

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -15,11 +16,11 @@ import (
 func (s *DoltStore) AddComment(ctx context.Context, issueID, actor, comment string) error {
 	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
 		isWisp := s.isActiveWisp(ctx, issueID)
-		tx, err := s.db.BeginTx(ctx, nil)
+		tx, err := guardtx.BeginTx(ctx, s.db, nil)
 		if err != nil {
 			return fmt.Errorf("begin tx: %w", err)
 		}
-		defer func() { _ = tx.Rollback() }()
+		defer func() { _ = guardtx.Rollback(tx) }()
 
 		clearJournalScope := s.scopeEventsJournalTransaction(tx)
 		defer clearJournalScope()

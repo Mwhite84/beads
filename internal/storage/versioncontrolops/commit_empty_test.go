@@ -71,6 +71,10 @@ func TestStageAndCommitCommitsWhenPending(t *testing.T) {
 	// ...confirm something is actually staged...
 	mock.ExpectQuery(matchStagedQuery.String()).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	// Native staged work permits the guard-stage seam, but this ordinary
+	// database has no guard capability. No token DOLT_ADD is allowed.
+	mock.ExpectQuery(`^SELECT COUNT\(\*\) FROM information_schema\.tables WHERE table_schema = DATABASE\(\) AND table_name = 'bd_guard_state'$`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	// ...and commit.
 	mock.ExpectExec(`CALL DOLT_COMMIT`).
 		WithArgs("real change", "tester").

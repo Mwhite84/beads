@@ -242,6 +242,14 @@ const backupRemoteSchemeTracking = "open question, not a verdict: remote-scheme 
 // proxyCapabilityRegistry is the whole path-keyed policy. Rows for permitted
 // paths are appended from proxyPermittedPaths by init.
 var proxyCapabilityRegistry = []capabilityRow{
+	// Experimental guarded storage has no proxied role. Refuse before any
+	// provider construction, schema migration or managed service startup.
+	refusedPath("guard", "proxy.guard.unsupported", ProxyReasonUnimplemented, "experimental guarded storage: proxied role").asParentGroup(),
+	refusedPath("guard capture", "proxy.guard.unsupported", ProxyReasonUnimplemented, "experimental guarded storage: proxied role"),
+	refusedPath("guard apply", "proxy.guard.unsupported", ProxyReasonUnimplemented, "experimental guarded storage: proxied role"),
+	refusedPath("guard lookup", "proxy.guard.unsupported", ProxyReasonUnimplemented, "experimental guarded storage: proxied role"),
+	refusedPath("guard initialize", "proxy.guard.unsupported", ProxyReasonUnimplemented, "experimental guarded storage: proxied role"),
+
 	// --- doctor -------------------------------------------------------------
 	// Diagnosis needs no version-control surface; the checks simply have no
 	// proxied dual yet. S6 splits them into client-local and store-backed.

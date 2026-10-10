@@ -40,6 +40,7 @@ func TestBeginTxScopesJournalActivationToThePinnedConn(t *testing.T) {
 	p.SetEventsJournalEnabled(true)
 
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 	mock.ExpectExec("UPDATE bd_events_seq SET next_seq").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT next_seq FROM bd_events_seq").
 		WillReturnRows(sqlmock.NewRows([]string{"next_seq"}).AddRow(7))
@@ -61,6 +62,7 @@ func TestBeginTxLeavesJournalOffWhenDisabled(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 
 	ctx := context.Background()
 	tx, err := p.BeginTx(ctx)
@@ -100,6 +102,7 @@ func TestTxEndReleasesJournalScope(t *testing.T) {
 			p, mock := newMockTxProvider(t)
 			p.SetEventsJournalEnabled(true)
 			mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+			expectGuardCapabilityAbsent(mock)
 
 			tx, err := p.BeginTx(context.Background())
 			require.NoError(t, err)

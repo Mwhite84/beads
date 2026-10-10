@@ -15,6 +15,7 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	doltembed "github.com/dolthub/driver/v2"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 )
 
 // validIdentifier matches safe SQL identifiers (letters, digits, underscores).
@@ -92,6 +93,13 @@ func OpenSQL(ctx context.Context, dir, database, branch string) (*sql.DB, func()
 		}
 	}
 
+	enabled, err := guardtx.Enabled(ctx, db)
+	if err != nil {
+		return nil, nil, errors.Join(fmt.Errorf("embedded: inspect native guard capability: %w", err), cleanup())
+	}
+	if enabled {
+		return nil, nil, errors.Join(fmt.Errorf("%w: guarded databases require the compatible MySQL native writer; embedded writes are unsupported", guardtx.ErrUnsupported), cleanup())
+	}
 	return db, cleanup, nil
 }
 

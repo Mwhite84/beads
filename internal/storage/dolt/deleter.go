@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	storeops "github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/workapi"
@@ -83,8 +84,21 @@ func (s *deleter) Delete(ctx context.Context, req issueops.DeleteRequest) (issue
 		}
 		// The same tables a sweep stages; the neighbor rewrite lands in
 		// `issues`, which is already on the list.
+		if err := guardtx.Prepare(ctx, tx); err != nil {
+			return err
+		}
 		for _, table := range sweptTables {
 			_ = schema.DrainCall(ctx, tx, "CALL DOLT_ADD(?)", table)
+		}
+		staged, err := storeops.HasStagedChanges(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !staged {
+			return nil
+		}
+		if err := guardtx.Stage(ctx, tx); err != nil {
+			return err
 		}
 		msg := fmt.Sprintf("bd: delete %d issue(s)", result.Deleted)
 		if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",

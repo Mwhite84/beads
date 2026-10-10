@@ -15,11 +15,13 @@ type SQLQuerier interface {
 
 // HasPendingChanges checks whether there are any committable changes in the
 // Dolt working set, excluding tables matched by dolt_ignore.
+// The native guard token alone is coordination state, not a native history effect.
+// bd_guard_operations remains included: an actual guarded result is durable work.
 func HasPendingChanges(ctx context.Context, db SQLQuerier) (bool, error) {
 	var count int
 	err := db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM dolt_status s
-		WHERE NOT EXISTS (
+		WHERE s.table_name <> 'bd_guard_state' AND NOT EXISTS (
 			SELECT 1 FROM dolt_ignore di
 			WHERE di.ignored = 1
 			AND s.table_name LIKE di.pattern
@@ -32,6 +34,7 @@ func HasPendingChanges(ctx context.Context, db SQLQuerier) (bool, error) {
 
 // HasStagedChanges reports whether the Dolt working set has any STAGED changes,
 // i.e. rows that a subsequent DOLT_COMMIT('-m', …) would actually commit.
+// A staged guard token alone must not turn an ordinary no-op into history.
 //
 // This is the correct pre-commit check for selective-staging commit helpers
 // (StageAndCommit, doltAddAndCommit, doltAddAndCommitInTx) that DOLT_ADD only a
@@ -46,7 +49,7 @@ func HasPendingChanges(ctx context.Context, db SQLQuerier) (bool, error) {
 func HasStagedChanges(ctx context.Context, db SQLQuerier) (bool, error) {
 	var count int
 	err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM dolt_status WHERE staged = 1").Scan(&count)
+		"SELECT COUNT(*) FROM dolt_status WHERE staged = 1 AND table_name <> 'bd_guard_state'").Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("failed to check staged status: %w", err)
 	}
