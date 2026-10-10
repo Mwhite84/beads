@@ -16,10 +16,17 @@ import (
 const StateTable = "bd_guard_state"
 const OperationsTable = "bd_guard_operations"
 
-// RootExpression also covers ignored inputs to release eligibility: events
-// history, lease liveness and the mixed-plane dependency refusal. Ignoring a
-// table for history must not make its changes invisible to audit concurrency.
-const RootExpression = "CONCAT(DOLT_HASHOF_DB(), ':', DOLT_HASHOF_TABLE('leases'), ':', DOLT_HASHOF_TABLE('events'), ':', DOLT_HASHOF_TABLE('wisp_dependencies'))"
+// RootExpression covers every ignored table mutated by supported runtime
+// writers, including shared UOW journal and cache bookkeeping. A table being
+// ignored for history must not hide its changes from audit concurrency.
+// ignored_schema_migrations belongs to exclusive schema maintenance instead.
+const RootExpression = "CONCAT(DOLT_HASHOF_DB(), " +
+	"':', DOLT_HASHOF_TABLE('leases'), ':', DOLT_HASHOF_TABLE('events'), " +
+	"':', DOLT_HASHOF_TABLE('wisps'), ':', DOLT_HASHOF_TABLE('wisp_labels'), " +
+	"':', DOLT_HASHOF_TABLE('wisp_dependencies'), ':', DOLT_HASHOF_TABLE('wisp_events'), " +
+	"':', DOLT_HASHOF_TABLE('wisp_comments'), ':', DOLT_HASHOF_TABLE('wisp_child_counters'), " +
+	"':', DOLT_HASHOF_TABLE('local_metadata'), ':', DOLT_HASHOF_TABLE('repo_mtimes'), " +
+	"':', DOLT_HASHOF_TABLE('bd_events_journal'), ':', DOLT_HASHOF_TABLE('bd_events_seq'))"
 
 var ErrUnsupported = errors.New("guard: unsupported transaction or storage state")
 var ErrConflict = errors.New("guard: original expectation no longer matches")

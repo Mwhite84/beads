@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 )
 
@@ -68,16 +69,18 @@ type BlockedRecomputeConn interface {
 // entry failed, and a caller that reported 0 there would be lying about the
 // database it is looking at.
 func RecomputeAllBlockedOnConn(ctx context.Context, conn BlockedRecomputeConn, author string) (int64, error) {
-	tx, err := conn.BeginTx(ctx, nil)
+	tx, err := guardtx.BeginTx(ctx, conn, nil)
 	if err != nil {
 		return 0, fmt.Errorf("begin is_blocked recompute: %w", err)
 	}
+	// Also release the transaction if guard preparation refuses before COMMIT.
+	defer func() { _ = guardtx.Rollback(tx) }()
 	changed, err := GuardedRecomputeAllBlockedInTx(ctx, tx)
 	if err != nil {
-		_ = tx.Rollback()
+		_ = guardtx.Rollback(tx)
 		return 0, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := guardtx.Commit(ctx, tx); err != nil {
 		return 0, fmt.Errorf("commit is_blocked recompute: %w", err)
 	}
 	if changed > 0 {

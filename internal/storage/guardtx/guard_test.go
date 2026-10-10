@@ -12,8 +12,8 @@ import (
 )
 
 // This literal is the independently reviewed scope, not the implementation's
-// constant: ignored event/dependency changes must join leases and versioned DB.
-const guardExpectedRootExpression = "CONCAT(DOLT_HASHOF_DB(), ':', DOLT_HASHOF_TABLE('leases'), ':', DOLT_HASHOF_TABLE('events'), ':', DOLT_HASHOF_TABLE('wisp_dependencies'))"
+// constant: every ignored runtime writer table must join the versioned DB.
+const guardExpectedRootExpression = "CONCAT(DOLT_HASHOF_DB(), ':', DOLT_HASHOF_TABLE('leases'), ':', DOLT_HASHOF_TABLE('events'), ':', DOLT_HASHOF_TABLE('wisps'), ':', DOLT_HASHOF_TABLE('wisp_labels'), ':', DOLT_HASHOF_TABLE('wisp_dependencies'), ':', DOLT_HASHOF_TABLE('wisp_events'), ':', DOLT_HASHOF_TABLE('wisp_comments'), ':', DOLT_HASHOF_TABLE('wisp_child_counters'), ':', DOLT_HASHOF_TABLE('local_metadata'), ':', DOLT_HASHOF_TABLE('repo_mtimes'), ':', DOLT_HASHOF_TABLE('bd_events_journal'), ':', DOLT_HASHOF_TABLE('bd_events_seq'))"
 
 // This driver models ordinary transactional SQL state and injected transport
 // failures. It proves guard protocol behavior, not Dolt hashing or concurrency.
