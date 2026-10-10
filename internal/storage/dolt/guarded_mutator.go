@@ -2,7 +2,9 @@ package dolt
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"github.com/steveyegge/beads/guardops"
 	"github.com/steveyegge/beads/internal/storage/guardtx"
 	storageissueops "github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/workapi"
 	"github.com/steveyegge/beads/issueops"
 )
@@ -292,8 +295,33 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 		}
 		var nativeResult any
 		tablesChanged := storageissueops.ChangedTables{}
-		if r.Effect.Kind == "clear-human-hold" {
+		if r.Effect.Kind == "audit-comment" {
+			if _, err := auditUnclaimedIssue(ctx, tx, r.Expected.IssueID); err != nil {
+				return err
+			}
+			commentID, err := addExactAuditComment(ctx, tx, r.Expected.IssueID, r.Actor, r.Effect.Comment)
+			if err != nil {
+				return err
+			}
+			nativeResult = struct {
+				IssueID   string `json:"issueId"`
+				Commented bool   `json:"commented"`
+				CommentID string `json:"commentId"`
+			}{IssueID: r.Expected.IssueID, Commented: true, CommentID: commentID}
+			tablesChanged.Add("comments", "events")
+		} else if r.Effect.Kind == "clear-human-hold" {
 			nativeResult, err = applyHumanClearanceInTx(ctx, tx, r)
+			if err != nil {
+				return err
+			}
+			tablesChanged.Add("labels", "events", "config")
+		} else if r.Effect.Kind == "archive-replace" || r.Effect.Kind == "validate" {
+			nativeResult, tablesChanged, err = applyAuditValidationInTx(ctx, tx, r)
+			if err != nil {
+				return err
+			}
+		} else if r.Effect.Kind == "add-human-hold" {
+			nativeResult, err = applyAuditHumanHoldInTx(ctx, tx, r)
 			if err != nil {
 				return err
 			}
@@ -387,6 +415,8 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 		message := "bd: guarded unclaim " + r.Expected.IssueID + " op " + r.OperationID
 		if r.Effect.Kind == "clear-human-hold" {
 			message = "bd: guarded clear human hold " + r.Expected.IssueID + " op " + r.OperationID
+		} else if r.Effect.Kind == "archive-replace" || r.Effect.Kind == "validate" || r.Effect.Kind == "add-human-hold" || r.Effect.Kind == "audit-comment" {
+			message = "bd: guarded audit " + r.Effect.Kind + " " + r.Expected.IssueID + " op " + r.OperationID
 		}
 		return g.store.doltAddAndCommitInTx(ctx, tx, tables, message)
 	})
@@ -439,8 +469,28 @@ func applyHumanClearanceInTx(ctx context.Context, tx *sql.Tx, r guardops.Request
 			return nil, fmt.Errorf("%w: immutable clearance record key already exists", guardtx.ErrUnsupported)
 		}
 	}
+	priorEvents, err := auditHoldRemovalIDs(ctx, tx, r.Expected.IssueID)
+	if err != nil {
+		return nil, err
+	}
 	if err := storageissueops.RemoveLabelInTx(ctx, tx, "labels", "events", r.Expected.IssueID, "human-required", r.Actor); err != nil {
 		return nil, err
+	}
+	currentEvents, err := auditHoldRemovalIDs(ctx, tx, r.Expected.IssueID)
+	if err != nil {
+		return nil, err
+	}
+	var removalEventID string
+	for id := range currentEvents {
+		if !priorEvents[id] {
+			if removalEventID != "" {
+				return nil, fmt.Errorf("%w: ambiguous native hold removal event", guardtx.ErrUnsupported)
+			}
+			removalEventID = id
+		}
+	}
+	if removalEventID == "" || len(currentEvents) != len(priorEvents)+1 {
+		return nil, fmt.Errorf("%w: missing native hold removal event", guardtx.ErrUnsupported)
 	}
 	for _, record := range []struct{ key, value string }{{r.Effect.ClearanceKey, r.Effect.ClearanceValue}, {r.Effect.HistoryKey, r.Effect.HistoryValue}} {
 		key := "kv." + record.key
@@ -468,5 +518,396 @@ func applyHumanClearanceInTx(ctx context.Context, tx *sql.Tx, r guardops.Request
 		Cleared         bool   `json:"cleared"`
 		MaterialVersion string `json:"materialVersion"`
 		HistoryComplete bool   `json:"historyComplete"`
-	}{r.Expected.IssueID, true, clearance.Value.MaterialVersion, false}, nil
+		RemovalEventID  string `json:"removalEventId"`
+		ClearanceKey    string `json:"clearanceKey"`
+		HistoryKey      string `json:"historyKey"`
+	}{r.Expected.IssueID, true, clearance.Value.MaterialVersion, false, removalEventID, r.Effect.ClearanceKey, r.Effect.HistoryKey}, nil
+}
+
+// Audit policy is deliberately separate from release/clearance primitives. An
+// exact snapshot does not authorize editing a claimed or completed work item.
+func auditUnclaimedIssue(ctx context.Context, tx *sql.Tx, id string) (*types.Issue, error) {
+	issue, err := storageissueops.GetIssueInTx(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	category, err := storageissueops.ReopenCategoryInTx(ctx, tx, issue.Status)
+	if err != nil {
+		return nil, err
+	}
+	metadata := map[string]json.RawMessage{}
+	// The ordinary native reader represents the SQL NULL/empty default as an
+	// empty RawMessage. That positively absent field has no claim pointer;
+	// nonempty JSON must still be a known object, never null/array/scalar.
+	if len(issue.Metadata) > 0 && (json.Unmarshal(issue.Metadata, &metadata) != nil || metadata == nil) {
+		return nil, fmt.Errorf("%w: unknown native claim metadata", guardtx.ErrUnsupported)
+	}
+	var pointer string
+	if raw, exists := metadata["krewe_claim_run"]; exists {
+		var value any
+		if json.Unmarshal(raw, &value) != nil {
+			return nil, fmt.Errorf("%w: malformed native claim pointer", guardtx.ErrUnsupported)
+		}
+		var valid bool
+		pointer, valid = value.(string)
+		if !valid {
+			return nil, fmt.Errorf("%w: malformed native claim pointer", guardtx.ErrUnsupported)
+		}
+	}
+	if category == types.CategoryDone || issue.Status == types.StatusInProgress || issue.Assignee != "" || pointer != "" {
+		return nil, fmt.Errorf("%w: audit requires unclaimed unclosed work", guardtx.ErrUnsupported)
+	}
+	return issue, nil
+}
+
+func requireAbsentAuditRecords(ctx context.Context, tx *sql.Tx, records []guardops.AuditRecord) error {
+	for _, record := range records {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM config WHERE `key`=?", "kv."+record.Key).Scan(&count); err != nil {
+			return err
+		}
+		if count != 0 {
+			return fmt.Errorf("%w: immutable audit key already exists", guardtx.ErrUnsupported)
+		}
+	}
+	return nil
+}
+func appendAuditRecords(ctx context.Context, tx *sql.Tx, records []guardops.AuditRecord) error {
+	for _, record := range records {
+		key := "kv." + record.Key
+		if err := storageissueops.SetConfigInTx(ctx, tx, key, record.Value); err != nil {
+			return err
+		}
+		var actualKey, actualValue string
+		if err := tx.QueryRowContext(ctx, "SELECT `key`,value FROM config WHERE `key`=?", key).Scan(&actualKey, &actualValue); err != nil {
+			return err
+		}
+		if actualKey != key || actualValue != record.Value {
+			return fmt.Errorf("%w: native audit KV did not preserve exact bytes", guardtx.ErrUnsupported)
+		}
+	}
+	return nil
+}
+func addExactAuditComment(ctx context.Context, tx *sql.Tx, id, actor, body string) (string, error) {
+	comment, err := storageissueops.AddIssueCommentInTx(ctx, tx, id, actor, body)
+	if err != nil {
+		return "", err
+	}
+	var stored string
+	if err := tx.QueryRowContext(ctx, "SELECT text FROM comments WHERE id=?", comment.ID).Scan(&stored); err != nil {
+		return "", err
+	}
+	if stored != body {
+		return "", fmt.Errorf("%w: exact audit archive readback failed", guardtx.ErrUnsupported)
+	}
+	const query = "SELECT COUNT(*) FROM events WHERE issue_id=? AND event_type='commented' AND actor=? AND CAST(comment AS BINARY)=CAST(? AS BINARY)"
+	var before, after int
+	if err := tx.QueryRowContext(ctx, query, id, actor, body).Scan(&before); err != nil {
+		return "", err
+	}
+	if err := storageissueops.AddCommentEventInTx(ctx, tx, id, actor, body); err != nil {
+		return "", err
+	}
+	if err := tx.QueryRowContext(ctx, query, id, actor, body).Scan(&after); err != nil {
+		return "", err
+	}
+	if after != before+1 {
+		return "", fmt.Errorf("%w: native archive event lost exact text", guardtx.ErrUnsupported)
+	}
+	return comment.ID, nil
+}
+func applyAuditValidationInTx(ctx context.Context, tx *sql.Tx, r guardops.Request) (any, storageissueops.ChangedTables, error) {
+	tables := storageissueops.ChangedTables{}
+	before, err := auditUnclaimedIssue(ctx, tx, r.Expected.IssueID)
+	if err != nil {
+		return nil, tables, err
+	}
+	records, err := guardops.DecodeAuditReceiptRecords(r.Effect.ReceiptRecordsJSON)
+	if err != nil {
+		return nil, tables, err
+	}
+	if err := requireAbsentAuditRecords(ctx, tx, records); err != nil {
+		return nil, tables, err
+	}
+	archiveID := ""
+	if r.Effect.Kind == "archive-replace" {
+		parts := strings.SplitN(r.Effect.ArchiveComment, "\n", 4)
+		if len(parts) != 4 || parts[3] != before.Description || r.Effect.AcceptedDescription == before.Description {
+			return nil, tables, fmt.Errorf("%w: archive must preserve exact original before a changed replacement", guardtx.ErrUnsupported)
+		}
+		archiveID, err = addExactAuditComment(ctx, tx, r.Expected.IssueID, r.Actor, r.Effect.ArchiveComment)
+		if err != nil {
+			return nil, tables, err
+		}
+		// Native helper receives ONLY description. Archive/readback has already
+		// completed in this transaction before any issue material is updated.
+		update, err := storageissueops.UpdateIssueInTx(ctx, tx, r.Expected.IssueID, map[string]interface{}{"description": r.Effect.AcceptedDescription}, r.Actor)
+		if err != nil {
+			return nil, tables, err
+		}
+		if !update.Changed || update.IsWisp {
+			return nil, tables, fmt.Errorf("%w: exact durable replacement required", guardtx.ErrUnsupported)
+		}
+		after, err := storageissueops.GetIssueInTx(ctx, tx, r.Expected.IssueID)
+		if err != nil {
+			return nil, tables, err
+		}
+		if after.Description != r.Effect.AcceptedDescription {
+			return nil, tables, fmt.Errorf("%w: exact replacement readback failed", guardtx.ErrUnsupported)
+		}
+		tables.Add("issues", "events", "comments")
+	}
+	if err := appendAuditRecords(ctx, tx, records); err != nil {
+		return nil, tables, err
+	}
+	tables.Add("config")
+	keys := make([]string, 0, len(records))
+	for _, record := range records {
+		keys = append(keys, record.Key)
+	}
+	return struct {
+		IssueID          string   `json:"issueId"`
+		Validated        bool     `json:"validated"`
+		ReceiptKeys      []string `json:"receiptKeys"`
+		Replaced         bool     `json:"replaced,omitempty"`
+		ArchiveCommentID string   `json:"archiveCommentId,omitempty"`
+	}{r.Expected.IssueID, true, keys, archiveID != "", archiveID}, tables, nil
+}
+
+func auditHoldRemovalIDs(ctx context.Context, tx *sql.Tx, id string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM events WHERE issue_id=? AND event_type='label_removed' AND CAST(comment AS BINARY)=CAST('Removed label: human-required' AS BINARY)", id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := map[string]bool{}
+	for rows.Next() {
+		var eventID string
+		if err := rows.Scan(&eventID); err != nil {
+			return nil, err
+		}
+		ids[eventID] = true
+	}
+	return ids, rows.Err()
+}
+
+func auditNamespaceRows(ctx context.Context, tx *sql.Tx, namespace string) ([]guardops.AuditRecord, error) {
+	// Filtering in Go avoids LIKE wildcard/collation aliases of immutable keys.
+	rows, err := tx.QueryContext(ctx, "SELECT `key`,value FROM config ORDER BY `key`")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	records := []guardops.AuditRecord{}
+	prefix := "kv.krewe.audit.v1." + namespace + "."
+	for rows.Next() {
+		var key string
+		var raw sql.NullString
+		if err := rows.Scan(&key, &raw); err != nil {
+			return nil, err
+		}
+		if strings.HasPrefix(key, prefix) {
+			if !raw.Valid {
+				return nil, fmt.Errorf("%w: unknown matching namespace record", guardtx.ErrUnsupported)
+			}
+			records = append(records, guardops.AuditRecord{Key: strings.TrimPrefix(key, "kv."), Value: raw.String})
+		}
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Key < records[j].Key })
+	return records, rows.Err()
+}
+
+func auditNamespaceDigest(records []guardops.AuditRecord) (string, error) {
+	// Match JSON.stringify([[appKey,rawValue],...]) exactly. Go's default HTML
+	// escaping differs from JS and must not change this original content proof.
+	matching := make([][2]string, 0, len(records))
+	for _, r := range records {
+		matching = append(matching, [2]string{r.Key, r.Value})
+	}
+	var buffer strings.Builder
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(matching); err != nil {
+		return "", err
+	}
+	encoded := strings.TrimSuffix(buffer.String(), "\n")
+	var js strings.Builder
+	for i := 0; i < len(encoded); i++ {
+		if encoded[i] == '\\' && i+1 < len(encoded) {
+			if strings.HasPrefix(encoded[i:], `\u2028`) {
+				js.WriteRune('\u2028')
+				i += 5
+				continue
+			}
+			if strings.HasPrefix(encoded[i:], `\u2029`) {
+				js.WriteRune('\u2029')
+				i += 5
+				continue
+			}
+			js.WriteByte(encoded[i])
+			i++
+			js.WriteByte(encoded[i])
+			continue
+		}
+		js.WriteByte(encoded[i])
+	}
+	digest := sha256.Sum256([]byte(js.String()))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func applyAuditHumanHoldInTx(ctx context.Context, tx *sql.Tx, r guardops.Request) (any, error) {
+	if _, err := auditUnclaimedIssue(ctx, tx, r.Expected.IssueID); err != nil {
+		return nil, err
+	}
+	hold, err := guardops.DecodeAuditHoldRecord(r)
+	if err != nil {
+		return nil, err
+	}
+	var held int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM labels WHERE issue_id=? AND CAST(label AS BINARY)=CAST('human-required' AS BINARY)", r.Expected.IssueID).Scan(&held); err != nil {
+		return nil, err
+	}
+	if held != 0 {
+		return nil, fmt.Errorf("%w: hold already exists", guardtx.ErrUnsupported)
+	}
+	records, err := auditNamespaceRows(ctx, tx, r.Effect.ClearanceNamespace)
+	if err != nil {
+		return nil, err
+	}
+	digest, err := auditNamespaceDigest(records)
+	if err != nil {
+		return nil, err
+	}
+	if digest != r.Effect.ClearanceContentDigest {
+		return nil, fmt.Errorf("%w: original clearance content mismatch", guardtx.ErrUnsupported)
+	}
+	var latest guardops.AuditClearance
+	var latestAt time.Time
+	var latestKey string
+	for _, record := range records {
+		c, err := guardops.ParseAuditClearance(record.Key, record.Value, r.Effect.ClearanceNamespace)
+		if err != nil {
+			return nil, fmt.Errorf("%w: unknown clearance record", guardtx.ErrUnsupported)
+		}
+		at, err := time.Parse(time.RFC3339Nano, c.ClearedAt)
+		if err != nil {
+			return nil, err
+		}
+		if at.Equal(latestAt) {
+			return nil, fmt.Errorf("%w: ambiguous clearance ordering", guardtx.ErrUnsupported)
+		}
+		if at.After(latestAt) {
+			latest = c
+			latestAt = at
+			latestKey = record.Key
+		}
+	}
+	if latestKey == "" || latest != hold.Value.Clearance || latest.MaterialVersion == r.Effect.MaterialVersion {
+		return nil, fmt.Errorf("%w: identified changed-material clearance required; no-prior/legacy history is unknown", guardtx.ErrUnsupported)
+	}
+	// Positive provenance is the native operation result's exact keys and
+	// removal event ID, never caller time versus server time. Old result rows
+	// without this linkage remain unknown. Every observed removal must link.
+	if err := verifyAuditClearanceProvenance(ctx, tx, r, hold, latestKey); err != nil {
+		return nil, err
+	}
+	newRecord := guardops.AuditRecord{Key: r.Effect.HoldRecordKey, Value: r.Effect.HoldRecordValue}
+	if err := requireAbsentAuditRecords(ctx, tx, []guardops.AuditRecord{newRecord}); err != nil {
+		return nil, err
+	}
+	if err := storageissueops.AddLabelInTx(ctx, tx, "labels", "events", r.Expected.IssueID, "human-required", r.Actor); err != nil {
+		return nil, err
+	}
+	if err := appendAuditRecords(ctx, tx, []guardops.AuditRecord{newRecord}); err != nil {
+		return nil, err
+	}
+	return struct {
+		IssueID         string `json:"issueId"`
+		Held            bool   `json:"held"`
+		MaterialVersion string `json:"materialVersion"`
+		HistoryComplete bool   `json:"historyComplete"`
+	}{r.Expected.IssueID, true, r.Effect.MaterialVersion, false}, nil
+}
+
+func verifyAuditClearanceProvenance(ctx context.Context, tx *sql.Tx, r guardops.Request, hold guardops.AuditHoldEnvelope, latestKey string) error {
+	records, err := auditNamespaceRows(ctx, tx, hold.Namespace)
+	if err != nil {
+		return err
+	}
+	linked := map[string]bool{}
+	latestLinked := false
+	for _, record := range records {
+		var discriminator struct {
+			Value struct {
+				Kind string `json:"kind"`
+			} `json:"value"`
+		}
+		if json.Unmarshal([]byte(record.Value), &discriminator) != nil {
+			return fmt.Errorf("%w: unknown prospective hold history", guardtx.ErrUnsupported)
+		}
+		if discriminator.Value.Kind == "bounded-unworkable-hold" {
+			var prior guardops.AuditHoldEnvelope
+			if json.Unmarshal([]byte(record.Value), &prior) != nil {
+				return guardtx.ErrUnsupported
+			}
+			proof := guardops.Request{OperationID: prior.Value.OperationID, Actor: prior.Value.Actor, Expected: guardops.Snapshot{Generation: prior.Value.GuardGeneration, Token: prior.Value.OriginalToken}, Effect: guardops.Effect{Kind: "add-human-hold", MaterialVersion: prior.Value.MaterialVersion, ClearanceNamespace: prior.Value.ClearanceNamespace, ClearanceContentDigest: prior.Value.ClearanceContentDigest, HoldRecordKey: record.Key, HoldRecordValue: record.Value}}
+			if _, err := guardops.DecodeAuditHoldRecord(proof); err != nil {
+				return fmt.Errorf("%w: malformed prospective hold history", guardtx.ErrUnsupported)
+			}
+			continue // This record claims no complete history or clearance event.
+		}
+		h, err := guardops.ParseAuditClearanceHistory(record.Key, record.Value, hold.Namespace)
+		if err != nil {
+			return fmt.Errorf("%w: unknown prospective clearance history", guardtx.ErrUnsupported)
+		}
+		var raw string
+		if err := tx.QueryRowContext(ctx, "SELECT result_json FROM bd_guard_operations WHERE operation_id=?", h.Value.OperationID).Scan(&raw); err != nil {
+			return fmt.Errorf("%w: missing native clearance operation", guardtx.ErrUnsupported)
+		}
+		var saved guardops.Result
+		var result struct {
+			IssueID         string `json:"issueId"`
+			Cleared         bool   `json:"cleared"`
+			MaterialVersion string `json:"materialVersion"`
+			HistoryComplete *bool  `json:"historyComplete"`
+			RemovalEventID  string `json:"removalEventId"`
+			ClearanceKey    string `json:"clearanceKey"`
+			HistoryKey      string `json:"historyKey"`
+		}
+		if json.Unmarshal([]byte(raw), &saved) != nil || saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.OperationID != h.Value.OperationID || json.Unmarshal([]byte(saved.ResultJSON), &result) != nil || result.IssueID != r.Expected.IssueID || !result.Cleared || result.HistoryComplete == nil || *result.HistoryComplete || result.MaterialVersion != h.Value.Clearance.MaterialVersion || result.RemovalEventID == "" || result.HistoryKey != record.Key || h.Value.GuardGeneration != r.Expected.Generation {
+			return fmt.Errorf("%w: legacy or unlinked native clearance result", guardtx.ErrUnsupported)
+		}
+		var clearanceRaw string
+		if err := tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key`=?", "kv."+result.ClearanceKey).Scan(&clearanceRaw); err != nil {
+			return err
+		}
+		clearance, err := guardops.ParseAuditClearance(result.ClearanceKey, clearanceRaw, r.Effect.ClearanceNamespace)
+		if err != nil || clearance != h.Value.Clearance {
+			return fmt.Errorf("%w: native clearance keys do not bind exact evidence", guardtx.ErrUnsupported)
+		}
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE id=? AND issue_id=? AND event_type='label_removed' AND CAST(actor AS BINARY)=CAST(? AS BINARY) AND CAST(comment AS BINARY)=CAST('Removed label: human-required' AS BINARY)", result.RemovalEventID, r.Expected.IssueID, clearance.ClearedBy).Scan(&count); err != nil {
+			return err
+		}
+		if count != 1 || linked[result.RemovalEventID] {
+			return fmt.Errorf("%w: ambiguous native clearance event linkage", guardtx.ErrUnsupported)
+		}
+		linked[result.RemovalEventID] = true
+		if result.ClearanceKey == latestKey {
+			latestLinked = true
+		}
+	}
+	removals, err := auditHoldRemovalIDs(ctx, tx, r.Expected.IssueID)
+	if err != nil {
+		return err
+	}
+	if !latestLinked || len(removals) != len(linked) {
+		return fmt.Errorf("%w: unknown legacy/manual clearance events", guardtx.ErrUnsupported)
+	}
+	for id := range removals {
+		if !linked[id] {
+			return fmt.Errorf("%w: unlinked manual clearance event", guardtx.ErrUnsupported)
+		}
+	}
+	return nil
 }

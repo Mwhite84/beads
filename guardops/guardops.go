@@ -34,12 +34,20 @@ type Snapshot struct {
 }
 
 type Effect struct {
-	Kind           string `json:"kind"`
-	Comment        string `json:"comment,omitempty"`
-	ClearanceKey   string `json:"clearanceKey,omitempty"`
-	ClearanceValue string `json:"clearanceValue,omitempty"`
-	HistoryKey     string `json:"historyKey,omitempty"`
-	HistoryValue   string `json:"historyValue,omitempty"`
+	Kind                   string `json:"kind"`
+	Comment                string `json:"comment,omitempty"`
+	ClearanceKey           string `json:"clearanceKey,omitempty"`
+	ClearanceValue         string `json:"clearanceValue,omitempty"`
+	HistoryKey             string `json:"historyKey,omitempty"`
+	HistoryValue           string `json:"historyValue,omitempty"`
+	ArchiveComment         string `json:"archiveComment,omitempty"`
+	AcceptedDescription    string `json:"acceptedDescription,omitempty"`
+	ReceiptRecordsJSON     string `json:"receiptRecordsJson,omitempty"`
+	MaterialVersion        string `json:"materialVersion,omitempty"`
+	ClearanceNamespace     string `json:"clearanceNamespace,omitempty"`
+	ClearanceContentDigest string `json:"clearanceContentDigest,omitempty"`
+	HoldRecordKey          string `json:"holdRecordKey,omitempty"`
+	HoldRecordValue        string `json:"holdRecordValue,omitempty"`
 }
 type Request struct {
 	Protocol    string   `json:"protocol"`
@@ -85,10 +93,16 @@ func Digest(r Request) string {
 	fields := []string{r.Protocol, r.OperationID, r.Actor, e.Protocol,
 		e.IssueID, e.Database, e.Branch, e.Head, e.Root, e.Generation, e.Token,
 		e.StateJSON, r.Effect.Kind}
-	if r.Effect.Kind == "release-with-comment" {
+	if r.Effect.Kind == "release-with-comment" || r.Effect.Kind == "audit-comment" {
 		fields = append(fields, r.Effect.Comment)
 	} else if r.Effect.Kind == "clear-human-hold" {
 		fields = append(fields, r.Effect.ClearanceKey, r.Effect.ClearanceValue, r.Effect.HistoryKey, r.Effect.HistoryValue)
+	} else if r.Effect.Kind == "archive-replace" {
+		fields = append(fields, r.Effect.ArchiveComment, r.Effect.AcceptedDescription, r.Effect.ReceiptRecordsJSON)
+	} else if r.Effect.Kind == "validate" {
+		fields = append(fields, r.Effect.ReceiptRecordsJSON)
+	} else if r.Effect.Kind == "add-human-hold" {
+		fields = append(fields, r.Effect.MaterialVersion, r.Effect.ClearanceNamespace, r.Effect.ClearanceContentDigest, r.Effect.HoldRecordKey, r.Effect.HoldRecordValue)
 	}
 	return digestStrings(append(fields, r.ContextJSON))
 }
@@ -131,18 +145,32 @@ func ValidateRequest(r Request) error {
 	}
 	switch r.Effect.Kind {
 	case "release":
-		if r.Effect.Comment != "" || hasClearanceFields(r.Effect) {
+		if r.Effect.Comment != "" || hasClearanceFields(r.Effect) || hasAuditFields(r.Effect) {
 			return ErrValidation
 		}
 	case "release-with-comment":
-		if hasClearanceFields(r.Effect) || strings.TrimSpace(r.Effect.Comment) == "" || len(r.Effect.Comment) > MaxCommentBytes || !utf8.ValidString(r.Effect.Comment) {
+		if hasAuditFields(r.Effect) || hasClearanceFields(r.Effect) || strings.TrimSpace(r.Effect.Comment) == "" || len(r.Effect.Comment) > MaxCommentBytes || !utf8.ValidString(r.Effect.Comment) {
 			return ErrValidation
 		}
+	case "audit-comment":
+		if hasAuditFields(r.Effect) || hasClearanceFields(r.Effect) || len(r.Actor) > 255 {
+			return ErrValidation
+		}
+		if err := validateAuditFailureComment(r.Effect.Comment); err != nil {
+			return err
+		}
 	case "clear-human-hold":
-		if r.Effect.Comment != "" || len(r.Actor) > 255 {
+		if hasAuditFields(r.Effect) || r.Effect.Comment != "" || len(r.Actor) > 255 {
 			return ErrValidation
 		}
 		if err := validateClearanceEffect(r); err != nil {
+			return err
+		}
+	case "archive-replace", "validate", "add-human-hold":
+		if r.Effect.Comment != "" || hasClearanceFields(r.Effect) || len(r.Actor) > 255 {
+			return ErrValidation
+		}
+		if err := validateAuditEffect(r); err != nil {
 			return err
 		}
 	default:

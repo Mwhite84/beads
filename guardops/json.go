@@ -10,7 +10,7 @@ import (
 )
 
 // MaxWireBytes allows the worst-case JSON escaping of bounded opaque strings.
-const MaxWireBytes = 6*(MaxStateBytes+MaxContextBytes+MaxCommentBytes+2*MaxClearanceRecordBytes) + (1 << 20)
+const MaxWireBytes = 6*(MaxStateBytes+MaxContextBytes+2*MaxCommentBytes+4*MaxClearanceRecordBytes) + (1 << 20)
 
 func DecodeRequest(raw []byte) (Request, error) {
 	var request Request
@@ -56,10 +56,20 @@ func decodeExact(raw []byte, target any) error {
 			return fmt.Errorf("%w: invalid effect shape", ErrValidation)
 		}
 		effectShape := wireShape{"kind": nil}
-		if discriminator.Effect.Kind == "release-with-comment" {
+		if discriminator.Effect.Kind == "release-with-comment" || discriminator.Effect.Kind == "audit-comment" {
 			effectShape["comment"] = nil
 		} else if discriminator.Effect.Kind == "clear-human-hold" {
 			for _, key := range []string{"clearanceKey", "clearanceValue", "historyKey", "historyValue"} {
+				effectShape[key] = nil
+			}
+		} else if discriminator.Effect.Kind == "archive-replace" {
+			for _, key := range []string{"archiveComment", "acceptedDescription", "receiptRecordsJson"} {
+				effectShape[key] = nil
+			}
+		} else if discriminator.Effect.Kind == "validate" {
+			effectShape["receiptRecordsJson"] = nil
+		} else if discriminator.Effect.Kind == "add-human-hold" {
+			for _, key := range []string{"materialVersion", "clearanceNamespace", "clearanceContentDigest", "holdRecordKey", "holdRecordValue"} {
 				effectShape[key] = nil
 			}
 		}
