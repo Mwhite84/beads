@@ -82,6 +82,8 @@ func (s *DoltStore) InitializeGuard(ctx context.Context) error {
 }
 
 func (g *guardedMutator) Capture(ctx context.Context, id string) (guardops.Snapshot, error) {
+	ctx, cancel := context.WithTimeout(ctx, guardCaptureTimeout)
+	defer cancel()
 	if strings.TrimSpace(id) == "" {
 		return guardops.Snapshot{}, guardops.ErrValidation
 	}
@@ -104,6 +106,8 @@ func (g *guardedMutator) withGuardReadTx(ctx context.Context, fn func(*sql.Tx) e
 }
 
 func captureGuardState(ctx context.Context, tx *sql.Tx, id string) (guardops.Snapshot, error) {
+	ctx, cancel := context.WithTimeout(ctx, guardCaptureTimeout)
+	defer cancel()
 	var s guardops.Snapshot
 	if !guardtx.Bound(tx) {
 		return s, fmt.Errorf("%w: database capability not initialized", guardtx.ErrUnsupported)
@@ -145,26 +149,14 @@ func captureGuardState(ctx context.Context, tx *sql.Tx, id string) (guardops.Sna
 			return s, fmt.Errorf("%w: related ignored graph or protected table", guardtx.ErrUnsupported)
 		}
 	}
-	// Fixed server-selected tables form a conservative application snapshot.
-	// Every scalar is retained as an exact string or null; int64 row_lock is
-	// never rounded by a JavaScript JSON parser. All config/KV rows are kept,
-	// including malformed application values, rather than a caller's filter.
-	state := map[string]any{"issueId": id}
-	for _, table := range []string{"issues", "labels", "dependencies", "config", "events", "comments", "leases"} {
-		rows, err := guardRows(ctx, tx, table)
-		if err != nil {
-			return s, err
-		}
-		state[table] = rows
-	}
-	encoded, err := json.Marshal(state)
+	// Root/generation/token retain the complete database commitment. The
+	// server-selected image supplies exact local material and the full graph
+	// without transporting unrelated issue bodies or audit history.
+	encoded, err := captureGuardImage(ctx, tx, id)
 	if err != nil {
 		return s, err
 	}
-	if len(encoded) > guardops.MaxStateBytes {
-		return s, fmt.Errorf("%w: snapshot exceeds admission limit", guardtx.ErrUnsupported)
-	}
-	s.StateJSON = string(encoded)
+	s.StateJSON = encoded
 	return s, guardops.ValidateSnapshot(s)
 }
 

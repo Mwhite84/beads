@@ -10,6 +10,28 @@ Apply compares the original capture before invoking the existing native release 
 
 Compatible ordinary transactions capture a composite working root, covering versioned state plus all 12 ignored runtime tables: leases, events, the five wisp data tables, wisp child counters, local metadata, repo mtimes, events journal and journal sequence. A real root change stamps a fresh shared token before publication; RowsAffected does not decide whether a same-value write changed state. Guard-enabled regular and ignored writes share native transaction ownership without enabling the optional events journal. Native leases and events retain their normal ignored-table semantics. Release, operation record and token share native history publication; ignored state is checked separately for SQL durability. The proxied blocked-state repair now uses the same guarded transaction boundary.
 
+### Bounded capture representation
+
+The opaque state now carries the inner format `native-graph-v1` under the same
+`beads.guard.v1` protocol. It includes the complete target issue, the ID and
+status of every other issue, all raw labels, typed dependencies, config and
+leases, and only the target's events and comments. SQL scalars remain exact
+strings or null; invalid UTF-8 refuses capture rather than replacing bytes.
+The composite root, generation and token still bind complete versioned and
+supported ignored state, including contents omitted from the transmitted image.
+Apply still requires the exact original snapshot and request digest. Captures
+from the older image format conflict after an upgrade; an already applied
+operation retains its recorded ledger-first replay behavior.
+
+Capture retains the 16 MiB encoded-state limit and adds a 30-second deadline
+covering transaction binding and capture, 100,000 projected rows per table
+(combining both issue projections), 128 columns per full row and 2 MiB per
+projected row. SQL count and raw-size admission precedes fetching contents; an
+inline size condition prevents an oversized row crossing the driver boundary
+if admission changes. Aggregate raw and encoded bytes remain bounded. Rows are
+encoded once and canonically sorted for deterministic retries. Limits refuse
+without dropping rows or permitting a partial graph.
+
 Guard commands suppress ordinary post-command flush/import/catalog/maintenance writes. Guard initialization uses the exclusive workspace gate. Embedded and proxied guard invocation refuses; the proxy registry returns `proxy.guard.unsupported` before creating a provider. Existing ordinary writer plumbing remains available, but that does not establish complete compatible-writer coverage.
 
 ## Evidence and operating limits
