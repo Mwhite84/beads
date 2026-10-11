@@ -26,7 +26,7 @@ func TestStageAndCommitAfterSQLCommitResponseLossIsIndeterminateAndNotReplayed(t
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			responseLoss := errors.New(tc.name + " response lost after SQL commit")
-			conn := &postSQLCommitFailureConn{failCall: tc.failCall, err: responseLoss, status: newDoltStatusStub(t)}
+			conn := &postSQLCommitFailureConn{failCall: tc.failCall, err: responseLoss, status: newDoltStatusStub(t, tc.failCall)}
 
 			err := stageAndCommitAfterSQLCommit(t.Context(), conn,
 				map[string]bool{"issues": true}, "bd: commit derived state", "tester <tester@example.com>")
@@ -46,22 +46,37 @@ func TestStageAndCommitAfterSQLCommitResponseLossIsIndeterminateAndNotReplayed(t
 	}
 }
 
-// newDoltStatusStub returns a *sql.DB whose dolt_status queries each yield a
-// single-row count of 1, standing in for the pending/staged empty-commit guard
-// reads (GH#4288 re-port) that StageAndCommit issues around its Exec calls.
+// newDoltStatusStub models exactly the native pending/staged reads reached
+// before the requested publication fault. The DOLT_COMMIT case also reaches
+// the guard capability probe, whose count zero keeps this legacy specimen on
+// its ordinary, guard-disabled path.
 // The version-control call counting below deliberately tracks only Exec calls,
 // so the guard reads stay invisible to the assertions.
-func newDoltStatusStub(t *testing.T) *sql.DB {
+func newDoltStatusStub(t *testing.T, failCall int) *sql.DB {
 	t.Helper()
-	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
-	for i := 0; i < 4; i++ {
-		mock.ExpectQuery(`FROM dolt_status`).
+	mock.ExpectQuery(`SELECT COUNT(*) FROM dolt_status s
+		WHERE s.table_name <> 'bd_guard_state' AND NOT EXISTS (
+			SELECT 1 FROM dolt_ignore di
+			WHERE di.ignored = 1
+			AND s.table_name LIKE di.pattern
+		)`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	if failCall == 2 {
+		mock.ExpectQuery("SELECT COUNT(*) FROM dolt_status WHERE staged = 1 AND table_name <> 'bd_guard_state'").
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		mock.ExpectQuery(`SELECT COUNT(*) FROM information_schema.tables
+			WHERE table_schema = DATABASE() AND table_name = 'bd_guard_state'`).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+		_ = db.Close()
+	})
 	return db
 }
 

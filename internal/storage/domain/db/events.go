@@ -7,6 +7,8 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 )
 
@@ -38,6 +40,19 @@ func (r *eventsSQLRepositoryImpl) DeleteAllForIDs(ctx context.Context, ids []str
 	table := "events"
 	if opts.UseWispsTable {
 		table = "wisp_events"
+	}
+	if !opts.UseWispsTable && guardtx.Bound(r.runner) {
+		for _, id := range ids {
+			var n int
+			if err := r.runner.QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE issue_id=?", id).Scan(&n); err != nil {
+				return 0, err
+			}
+			if n != 0 {
+				if _, err := guardbirth.Spend(ctx, r.runner, id, "", "domain-durable-event-loss"); err != nil {
+					return 0, err
+				}
+			}
+		}
 	}
 	total := 0
 	for start := 0; start < len(ids); start += deleteBatchSize {

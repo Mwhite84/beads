@@ -33,6 +33,14 @@ func newMockTxProvider(t *testing.T) (*doltSQLProvider, sqlmock.Sqlmock) {
 	return &doltSQLProvider{defaultBranch: defaultBranch, db: mockDB}, mock
 }
 
+// expectGuardCapabilityAbsent models an ordinary upstream database with no
+// explicit native guard initialization. Keep this exact probe in SQL order;
+// it must not authorize token reads/staging or hide an unexpected statement.
+func expectGuardCapabilityAbsent(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(`^SELECT COUNT\(\*\) FROM information_schema\.tables WHERE table_schema = DATABASE\(\) AND table_name = 'bd_guard_state'$`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+}
+
 // matchHasPending matches the dolt_status working-set check issued by
 // issueops.HasPendingChanges — the guard Commit runs before deciding whether
 // to mint a Dolt commit (#4348 re-port).
@@ -43,11 +51,16 @@ const matchHasPending = `SELECT COUNT\(\*\) FROM dolt_status`
 func expectPendingChanges(mock sqlmock.Sqlmock, count int) {
 	mock.ExpectQuery(matchHasPending).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(count))
+	if count > 0 {
+		// Native pending work permits Stage; capability remains absent.
+		expectGuardCapabilityAbsent(mock)
+	}
 }
 
 func TestDoltServerTxCommitFailureRollsBackBeforeRelease(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 	expectPendingChanges(mock, 1)
 	mock.ExpectExec("DOLT_COMMIT").WillReturnError(errors.New("commit exploded"))
 	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
@@ -64,6 +77,7 @@ func TestDoltServerTxCommitFailureRollsBackBeforeRelease(t *testing.T) {
 func TestDoltServerTxCommitAndRollbackFailurePoisonsConn(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 	expectPendingChanges(mock, 1)
 	mock.ExpectExec("DOLT_COMMIT").WillReturnError(errors.New("commit exploded"))
 	mock.ExpectExec("ROLLBACK").WillReturnError(errors.New("rollback exploded too"))
@@ -79,6 +93,7 @@ func TestDoltServerTxCommitAndRollbackFailurePoisonsConn(t *testing.T) {
 func TestDoltServerTxRollbackFailurePoisonsConn(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 	mock.ExpectExec("ROLLBACK").WillReturnError(errors.New("rollback exploded"))
 
 	tx, err := p.BeginTx(context.Background())
@@ -115,6 +130,7 @@ const matchPlainCommit = `^COMMIT;$`
 func TestDoltServerTxCommitSkipsEmptyDoltCommit(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 	// Clean working set: the guard reports nothing pending…
 	expectPendingChanges(mock, 0)
 	// …so the tx must close with a plain COMMIT. Deliberately NO expectation
@@ -138,6 +154,7 @@ func TestDoltServerTxCommitSkipsEmptyDoltCommit(t *testing.T) {
 func TestDoltServerTxCommitIssuesDoltCommitWhenPending(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 	expectPendingChanges(mock, 3)
 	mock.ExpectExec("DOLT_COMMIT").WithArgs("bd: real write").WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -152,6 +169,7 @@ func TestDoltServerTxCommitIssuesDoltCommitWhenPending(t *testing.T) {
 func TestDoltServerTxCommitPendingCheckFailureRollsBackBeforeRelease(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 	mock.ExpectQuery(matchHasPending).WillReturnError(errors.New("status check exploded"))
 	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -173,6 +191,7 @@ func TestDoltServerTxCommitPendingCheckFailureRollsBackBeforeRelease(t *testing.
 func TestDoltServerTxCommitPropagatesNothingToCommit(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 	expectPendingChanges(mock, 1)
 	mock.ExpectExec("DOLT_COMMIT").WillReturnError(errors.New("nothing to commit"))
 	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
@@ -192,6 +211,7 @@ func TestDoltServerTxCommitPropagatesNothingToCommit(t *testing.T) {
 func TestDoltServerTxEphemeralCommitSkipsPendingCheck(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 	// No dolt_status query expected: an added guard round-trip would surface
 	// as an unexpected query and fail Commit.
 	mock.ExpectExec(matchPlainCommit).WillReturnResult(sqlmock.NewResult(0, 0))
@@ -220,6 +240,7 @@ func TestDoltServerTxCommitDefersDoltCommitUnderDeferredContext(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			p, mock := newMockTxProvider(t)
 			mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+			expectGuardCapabilityAbsent(mock)
 			if tc.deferred {
 				// With deferred version commit (GH#4995), the non-empty message is blanked,
 				// skipping DOLT_COMMIT and executing plain COMMIT without status check.
@@ -255,6 +276,7 @@ func TestDoltServerTxCommitDefersDoltCommitUnderDeferredContext(t *testing.T) {
 func TestDoltServerTxCommitHonorsImmediateVersionCommit(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 	expectPendingChanges(mock, 1)
 	mock.ExpectExec("DOLT_COMMIT").WithArgs("bd: batch 3 ops by tester").WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -275,6 +297,7 @@ func TestDoltServerTxCommitHonorsImmediateVersionCommit(t *testing.T) {
 func TestDoltServerTxRunTxWithDeferredContextSkipsDoltCommit(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectGuardCapabilityAbsent(mock)
 	mock.ExpectExec(matchPlainCommit).WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ctx := issueops.WithDeferredVersionCommit(context.Background())

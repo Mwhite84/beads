@@ -48,6 +48,7 @@ func TestServerSettlementSQLCommitResponseLossIsIndeterminate(t *testing.T) {
 		t.Cleanup(func() { _ = db.Close() })
 
 		mock.ExpectBegin()
+		expectOrdinaryGuardAbsent(mock)
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT DISTINCT table_name FROM dolt_status WHERE table_name IN (?,?)")).
 			WithArgs("issues", "dependencies").
 			WillReturnRows(sqlmock.NewRows([]string{"table_name"}))
@@ -77,6 +78,7 @@ func TestServerSettlementSQLCommitResponseLossIsIndeterminate(t *testing.T) {
 		t.Cleanup(func() { _ = db.Close() })
 
 		mock.ExpectBegin()
+		expectOrdinaryGuardAbsent(mock)
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT value FROM metadata WHERE `key` = ?")).
 			WithArgs("is_blocked_recompute_pending").
 			WillReturnRows(sqlmock.NewRows([]string{"value"}))
@@ -155,6 +157,8 @@ func TestCommitWorkingSetAfterSQLCommitResponseLossIsIndeterminate(t *testing.T)
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
 					WithArgs("issues").
 					WillReturnRows(sqlmock.NewRows([]string{"status"}))
+				expectOrdinaryStagedWork(mock)
+				expectOrdinaryGuardAbsent(mock)
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 					WithArgs("bd: recompute is_blocked after pull", " <>").
 					WillReturnError(responseLoss)

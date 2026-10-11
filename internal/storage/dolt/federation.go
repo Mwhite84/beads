@@ -599,6 +599,8 @@ func deleteFederationStagingBranch(ctx context.Context, conn *sql.Conn, stagingB
 // branch selected by conn. Dolt branch state is session-scoped, so every step
 // stays on that pinned connection.
 func (s *DoltStore) commitFilteredStaging(ctx context.Context, conn *sql.Conn) error {
+	// Native guard MVP exclusion: filtered staging rewrites a sync branch/root. Drain audits
+	// and invalidate their expectations for maintenance; this is not a guarded runtime write.
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("federation filter: begin staged is_blocked recompute: %w", err)

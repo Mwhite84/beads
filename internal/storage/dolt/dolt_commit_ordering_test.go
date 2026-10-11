@@ -123,7 +123,10 @@ func (c *seqConn) QueryContext(_ context.Context, query string, _ []driver.Named
 			return rows, nil
 		}
 	}
-	if strings.Contains(query, "FROM dolt_status") {
+	if isOrdinaryGuardCapabilityProbe(query) {
+		return &valRows{cols: []string{"count"}, vals: [][]driver.Value{{int64(0)}}}, nil
+	}
+	if isOrdinaryNativeCommitCountQuery(query) {
 		// doltAddAndCommit's empty-commit guard: report one staged row so the
 		// post-tx sequence under test still reaches DOLT_COMMIT.
 		return &valRows{cols: []string{"count"}, vals: [][]driver.Value{{int64(1)}}}, nil

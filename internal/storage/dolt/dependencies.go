@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -97,11 +98,11 @@ func (s *DoltStore) RemoveDependencyWithOptions(ctx context.Context, issueID, de
 	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
 		// Wisps live in dolt_ignored tables — skip Dolt versioning entirely.
 		if s.isActiveWisp(ctx, issueID) {
-			tx, err := s.db.BeginTx(ctx, nil)
+			tx, err := guardtx.BeginTx(ctx, s.db, nil)
 			if err != nil {
 				return fmt.Errorf("failed to begin transaction: %w", err)
 			}
-			defer func() { _ = tx.Rollback() }()
+			defer func() { _ = guardtx.Rollback(tx) }()
 			clearJournalScope := s.scopeEventsJournalTransaction(tx)
 			defer clearJournalScope()
 			clearRecheckScope := issueops.ScopeBlockedRecheckTransaction(tx)
@@ -115,11 +116,11 @@ func (s *DoltStore) RemoveDependencyWithOptions(ctx context.Context, issueID, de
 			return nil
 		}
 
-		tx, err := s.db.BeginTx(ctx, nil)
+		tx, err := guardtx.BeginTx(ctx, s.db, nil)
 		if err != nil {
 			return fmt.Errorf("failed to begin transaction: %w", err)
 		}
-		defer func() { _ = tx.Rollback() }()
+		defer func() { _ = guardtx.Rollback(tx) }()
 
 		clearJournalScope := s.scopeEventsJournalTransaction(tx)
 		defer clearJournalScope()

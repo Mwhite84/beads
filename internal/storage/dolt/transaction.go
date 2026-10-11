@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
@@ -37,7 +39,7 @@ type doltTransaction struct {
 	wroteRegularDep bool
 	wroteWispDep    bool
 	// journalPinned records that ignoredTx IS regularTx because the events
-	// journal collapsed the two planes into one transaction, so the finish path
+	// journal or guard capability collapsed the planes into one transaction, so the finish path
 	// must not commit or roll it back a second time.
 	journalPinned bool
 }
@@ -206,7 +208,7 @@ func (s *DoltStore) runDoltTransactionRecording(ctx context.Context, commitMsg s
 		return issueops.BlockedRecheck{}, fmt.Errorf("failed to read active branch: %w", err)
 	}
 
-	regularTx, err := conn.BeginTx(ctx, nil)
+	regularTx, err := guardtx.BeginTx(ctx, conn, nil)
 	if err != nil {
 		return issueops.BlockedRecheck{}, fmt.Errorf("failed to begin regular tx: %w", err)
 	}
@@ -223,8 +225,13 @@ func (s *DoltStore) runDoltTransactionRecording(ctx context.Context, commitMsg s
 	// pinned regular transaction. The default journal-off path keeps the
 	// established split transactions untouched.
 	journalEnabled := s.eventsJournalEnabled.Load()
+	// Guarded writers must stamp their regular and ignored eligibility inputs
+	// in one transaction; independent stamps would self-conflict after the
+	// regular side commits. This uses the established shared-session shape
+	// without changing whether the events journal itself is enabled.
+	singleTransaction := journalEnabled || guardtx.Bound(regularTx)
 	ignoredTx := regularTx
-	if !journalEnabled {
+	if !singleTransaction {
 		// NOTE (GH#3140 metrics skew): the pool-wait bracket above measures only
 		// the FIRST acquisition (the regular conn). A borrow inside
 		// beginIgnoredTxOnBranch that has to wait increments the pool's global
@@ -234,7 +241,7 @@ func (s *DoltStore) runDoltTransactionRecording(ctx context.Context, commitMsg s
 		var ignoredCleanup func()
 		ignoredCleanup, ignoredTx, err = s.beginIgnoredTxOnBranch(ctx, currentBranch)
 		if err != nil {
-			_ = regularTx.Rollback()
+			_ = guardtx.Rollback(regularTx)
 			return issueops.BlockedRecheck{}, err
 		}
 		defer ignoredCleanup()
@@ -246,27 +253,27 @@ func (s *DoltStore) runDoltTransactionRecording(ctx context.Context, commitMsg s
 	// does not pin both planes together.
 	clearRecheckScope := issueops.ScopeBlockedRecheckTransaction(regularTx)
 	defer clearRecheckScope()
-	if !journalEnabled {
+	if !singleTransaction {
 		clearIgnoredRecheckScope := issueops.ScopeBlockedRecheckTransaction(ignoredTx)
 		defer clearIgnoredRecheckScope()
 	}
 
-	tx := &doltTransaction{regularTx: regularTx, ignoredTx: ignoredTx, store: s, journalPinned: journalEnabled}
+	tx := &doltTransaction{regularTx: regularTx, ignoredTx: ignoredTx, store: s, journalPinned: singleTransaction}
 
 	defer func() {
 		if r := recover(); r != nil {
-			_ = regularTx.Rollback()
-			if !journalEnabled {
-				_ = ignoredTx.Rollback()
+			_ = guardtx.Rollback(regularTx)
+			if !singleTransaction {
+				_ = guardtx.Rollback(ignoredTx)
 			}
 			panic(r)
 		}
 	}()
 
 	if err := fn(tx); err != nil {
-		_ = regularTx.Rollback()
-		if !journalEnabled {
-			_ = ignoredTx.Rollback()
+		_ = guardtx.Rollback(regularTx)
+		if !singleTransaction {
+			_ = guardtx.Rollback(ignoredTx)
 		}
 		return issueops.BlockedRecheck{}, err
 	}
@@ -307,11 +314,11 @@ func (s *DoltStore) finishDoltTransactionRecording(ctx context.Context, conn *sq
 func (s *DoltStore) finishDoltTransaction(ctx context.Context, conn *sql.Conn, tx *doltTransaction, commitMsg string) error {
 	rollbackIgnored := func() {
 		if !tx.journalPinned {
-			_ = tx.ignoredTx.Rollback()
+			_ = guardtx.Rollback(tx.ignoredTx)
 		}
 	}
 
-	if err := tx.regularTx.Commit(); err != nil {
+	if err := guardtx.Commit(ctx, tx.regularTx); err != nil {
 		rollbackIgnored()
 		return wrapSQLCommitError("sql commit (regular)", err)
 	}
@@ -324,7 +331,7 @@ func (s *DoltStore) finishDoltTransaction(ctx context.Context, conn *sql.Conn, t
 	if tx.journalPinned {
 		return nil
 	}
-	if err := tx.ignoredTx.Commit(); err != nil {
+	if err := guardtx.Commit(ctx, tx.ignoredTx); err != nil {
 		return fmt.Errorf("sql commit (ignored, regular already committed): %w: %w", err, ErrCommitIndeterminate)
 	}
 	return nil
@@ -440,7 +447,7 @@ func beginBorrowedTx(ctx context.Context, conn *sql.Conn, branch string) (*sql.T
 	if active != branch {
 		return nil, fmt.Errorf("borrowed conn is on branch %q, want %q: refusing to switch a pooled session's branch", active, branch)
 	}
-	tx, err := conn.BeginTx(ctx, nil)
+	tx, err := guardtx.BeginTx(ctx, conn, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin ignored tx: %w", err)
 	}
@@ -456,7 +463,7 @@ func beginTxOnConn(ctx context.Context, conn *sql.Conn, branch string) (*sql.Tx,
 	if _, err := conn.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", branch); err != nil {
 		return nil, fmt.Errorf("failed to checkout ignored tx branch %s: %w", branch, err)
 	}
-	tx, err := conn.BeginTx(ctx, nil)
+	tx, err := guardtx.BeginTx(ctx, conn, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin ignored tx: %w", err)
 	}
@@ -863,7 +870,7 @@ func (t *doltTransaction) DeleteIssue(ctx context.Context, id string) error {
 	// Mark every table the ON DELETE CASCADE fans out to, not just the row's
 	// own table: the cascaded deletions are invisible to the SQL we issue, so
 	// staging only `issues` leaves them uncommitted in the working set.
-	for _, cascaded := range issueops.DeleteCascadeTables(isWisp) {
+	for _, cascaded := range guardbirth.PublicationTables(t.txFor(table), issueops.DeleteCascadeTables(isWisp)) {
 		t.dirty.MarkDirty(cascaded)
 	}
 	return nil

@@ -12,6 +12,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/depid"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -143,6 +144,16 @@ func CreateIssueInTxWithResult(ctx context.Context, tx DBTX, bc *BatchContext, i
 		return result, nil
 	}
 	result.markChanged(issueTable)
+	if issueTable == "issues" && !bc.Opts.CreateOnly {
+		changed, err := guardbirth.Spend(ctx, tx, issue.ID, actor, "non-create-only-write")
+		if err != nil {
+			return result, err
+		}
+		if changed {
+			result.markChanged("config")
+			result.markChanged("bd_guard_operations")
+		}
+	}
 
 	// Reconcile the ephemeral lease row with the accepted issue state
 	// (restore an imported lease / drop an orphaned one — see
@@ -154,8 +165,11 @@ func CreateIssueInTxWithResult(ctx context.Context, tx DBTX, bc *BatchContext, i
 		}
 	}
 
+	createdEventID := ""
 	if isNew {
-		if err := RecordEventInTable(ctx, tx, eventTable, issue.ID, types.EventCreated, actor, ""); err != nil {
+		var err error
+		createdEventID, err = InsertDerivedEventReturningID(ctx, tx, eventTable, AuxEvent{IssueID: issue.ID, EventType: types.EventCreated, Actor: actor, OldValue: str(""), NewValue: str("")})
+		if err != nil {
 			return result, fmt.Errorf("failed to record event for %s: %w", issue.ID, err)
 		}
 		result.markChanged(eventTable)
@@ -172,6 +186,17 @@ func CreateIssueInTxWithResult(ctx context.Context, tx DBTX, bc *BatchContext, i
 	}
 	result.ChangedTables = mergeChangedTables(result.ChangedTables, commentResult.ChangedTables)
 	result.persistedComments = append(result.persistedComments, commentResult.persistedComments...)
+
+	if issueTable == "issues" && isNew && bc.Opts.CreateOnly {
+		changed, err := guardbirth.Enroll(ctx, tx, issue.ID, actor, createdEventID)
+		if err != nil {
+			return result, err
+		}
+		if changed {
+			result.markChanged("config")
+			result.markChanged("bd_guard_operations")
+		}
+	}
 
 	// Advance child_counters when a singular create materializes a hierarchical
 	// ID (e.g. bd create --id P.8). The batch path already calls

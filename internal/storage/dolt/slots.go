@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 )
 
@@ -51,11 +52,11 @@ func (s *DoltStore) MergeMetadata(ctx context.Context, issueID, key string, valu
 // versioning since wisps live in dolt_ignored tables. The read and write still
 // share the one transaction, so the atomic-merge property holds.
 func (s *DoltStore) mergeMetadataWisp(ctx context.Context, issueID, key string, value json.RawMessage, actor string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := guardtx.BeginTx(ctx, s.db, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = guardtx.Rollback(tx) }()
 
 	clearJournalScope := s.scopeEventsJournalTransaction(tx)
 	defer clearJournalScope()
@@ -152,11 +153,11 @@ func (s *DoltStore) SlotClear(ctx context.Context, issueID, key, actor string) e
 // clearMetadataWisp clears a metadata key on a wisp. Mirrors mergeMetadataWisp /
 // closeWisp: no Dolt versioning since wisps live in dolt_ignored tables.
 func (s *DoltStore) clearMetadataWisp(ctx context.Context, issueID, key, actor string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := guardtx.BeginTx(ctx, s.db, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = guardtx.Rollback(tx) }()
 
 	clearJournalScope := s.scopeEventsJournalTransaction(tx)
 	defer clearJournalScope()

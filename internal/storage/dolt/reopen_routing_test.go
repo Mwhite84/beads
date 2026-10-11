@@ -56,6 +56,10 @@ func (c *reopenPromotionConn) QueryContext(_ context.Context, query string, args
 	c.driver.mu.Lock()
 	defer c.driver.mu.Unlock()
 
+	if isOrdinaryGuardCapabilityProbe(query) {
+		return &reopenPromotionRows{columns: []string{"count"}, values: [][]driver.Value{{int64(0)}}}, nil
+	}
+
 	if strings.Contains(query, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1") {
 		if !c.driver.inTx {
 			c.driver.preTxWispProbe = true
@@ -69,7 +73,7 @@ func (c *reopenPromotionConn) QueryContext(_ context.Context, query string, args
 			values:  [][]driver.Value{{string("closed")}},
 		}, nil
 	}
-	if strings.Contains(query, "FROM dolt_status") {
+	if isOrdinaryNativeCommitCountQuery(query) {
 		// Empty-commit guard (GH#4288 re-port): report one staged row so the
 		// commit path under test still reaches DOLT_COMMIT.
 		return &reopenPromotionRows{columns: []string{"count"}, values: [][]driver.Value{{int64(1)}}}, nil

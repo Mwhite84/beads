@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -64,6 +65,14 @@ func MoveIssuePersistenceInTx(ctx context.Context, tx DBTX, current *types.Issue
 		if err := rejectPersistenceDemotion(ctx, tx, current.ID); err != nil {
 			return PersistenceMoveResult{}, err
 		}
+	}
+	changed, err := guardbirth.Spend(ctx, tx, current.ID, actor, "persistence-plane-move")
+	if err != nil {
+		return PersistenceMoveResult{}, err
+	}
+	if changed {
+		result.ChangedTables["config"] = true
+		result.ChangedTables["bd_guard_operations"] = true
 	}
 	move := *current
 	move.Ephemeral, move.NoHistory, move.StorageClass, move.RowVersion = ephemeral, noHistory, storageClass, FreshRowLock()

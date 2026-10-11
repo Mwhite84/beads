@@ -120,6 +120,11 @@ func (c *mockConn) Begin() (driver.Tx, error) {
 // We simulate a small amount of work so the concurrency test can observe
 // SetMaxOpenConns back-pressure.
 func (c *mockConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if isOrdinaryGuardCapabilityProbe(query) {
+		c.drv.recordQuery(query)
+		return &mockRows{val: int64(0)}, nil
+	}
+
 	if strings.Contains(query, "active_branch") {
 		c.drv.recordQuery(query)
 		if c.drv.failActiveBranch.Load() {

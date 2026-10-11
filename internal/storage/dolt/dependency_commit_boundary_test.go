@@ -61,6 +61,8 @@ func (c *dependencyCommitBoundaryConn) QueryContext(_ context.Context, query str
 	defer c.driver.mu.Unlock()
 
 	switch {
+	case isOrdinaryGuardCapabilityProbe(query):
+		return &dependencyCommitBoundaryRows{columns: []string{"count"}, values: [][]driver.Value{{int64(0)}}}, nil
 	case strings.Contains(query, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1"):
 		if c.driver.activeWisp {
 			return &dependencyCommitBoundaryRows{columns: []string{"exists"}, values: [][]driver.Value{{int64(1)}}}, nil

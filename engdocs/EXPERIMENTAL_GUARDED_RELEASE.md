@@ -1,0 +1,47 @@
+# Local experimental guarded release
+
+This local branch extends Beads 1.3.1 (`c1c4b642ac1c08d8c828007a1c2f96e47e43ef7c`) with an optional direct-server guarded-release role. It is a checkpoint for review and disposable testing. It does not activate a nightly audit or authorize a production writer cutover.
+
+## Contract and commands
+
+`bd guard initialize --experimental` explicitly creates the guard singleton and operation ledger in an exclusively opened workspace. Initialization is maintenance, not an automatic migration. `bd guard capture <issue>` returns the original database/branch/HEAD/root/generation/token identity and opaque server-selected state. `bd guard apply --request-json <path>` consumes a strict `beads.guard.v1` release request; `bd guard lookup --request-json <path>` resolves its stable operation ID and exact request digest. The Go API is in `guardops` and the implementation in `internal/storage/dolt/guarded_mutator.go`.
+
+Apply compares the original capture before invoking the existing native release operation. It records the exact operation/digest/result alongside the release and conflict token. Exact replay checks the operation ledger before the now-stale original capture and returns the recorded result. Reusing the ID with different request content refuses. Publication errors return an unknown outcome; callers must use fresh Lookup before deciding what happened. An absent lookup does not silently authorize a blind retry or replacement capture.
+
+Compatible ordinary transactions capture a composite working root, covering versioned state plus all 12 ignored runtime tables: leases, events, the five wisp data tables, wisp child counters, local metadata, repo mtimes, events journal and journal sequence. A real root change stamps a fresh shared token before publication; RowsAffected does not decide whether a same-value write changed state. Guard-enabled regular and ignored writes share native transaction ownership without enabling the optional events journal. Native leases and events retain their normal ignored-table semantics. Release, operation record and token share native history publication; ignored state is checked separately for SQL durability. The proxied blocked-state repair now uses the same guarded transaction boundary.
+
+### Bounded capture representation
+
+The opaque state now carries the inner format `native-graph-v1` under the same
+`beads.guard.v1` protocol. It includes the complete target issue, the ID and
+status of every other issue, all raw labels, typed dependencies, config and
+leases, and only the target's events and comments. SQL scalars remain exact
+strings or null; invalid UTF-8 refuses capture rather than replacing bytes.
+The composite root, generation and token still bind complete versioned and
+supported ignored state, including contents omitted from the transmitted image.
+Apply still requires the exact original snapshot and request digest. Captures
+from the older image format conflict after an upgrade; an already applied
+operation retains its recorded ledger-first replay behavior.
+
+Capture retains the 16 MiB encoded-state limit and adds a 30-second deadline
+covering transaction binding and capture, 100,000 projected rows per table
+(combining both issue projections), 128 columns per full row and 2 MiB per
+projected row. SQL count and raw-size admission precedes fetching contents; an
+inline size condition prevents an oversized row crossing the driver boundary
+if admission changes. Aggregate raw and encoded bytes remain bounded. Rows are
+encoded once and canonically sorted for deterministic retries. Limits refuse
+without dropping rows or permitting a partial graph.
+
+Guard commands suppress ordinary post-command flush/import/catalog/maintenance writes. Guard initialization uses the exclusive workspace gate. Embedded and proxied guard invocation refuses; the proxy registry returns `proxy.guard.unsupported` before creating a provider. Existing ordinary writer plumbing remains available, but that does not establish complete compatible-writer coverage.
+
+## Evidence and operating limits
+
+The task-local direct-server candidate compiles with cached Go 1.26.6, CGO disabled and `gms_pure_go`. Actual native primitive controls passed for release/replay/request mismatch, ordinary config/label/dependency/material invalidation, an ordered acknowledged ordinary-config race after tentative release, and successful real SQL Commit followed by injected acknowledgement loss and fresh-store recovery. New representative controls passed for ordinary metadata/lifecycle publication, eight ignored writer routes, shared regular/wisp transactions with journal off/on, journal-only prune, same-value config and proxied blocked repair. Independent Krewe CLI transport, actual captured audit observations and restart controls passed in the sibling proof directory. The CLI file made 95 assertions. Consult its current execution report for precise results.
+
+The root-owned harness uses only private loopback Dolt data and isolated HOME/Git/Dolt configuration. Existing frozen controls are preserved. Ordinary mock fixtures model the capability-absent probe while retaining their existing rollback, connection poisoning, journal and empty-commit assertions.
+
+This experiment conservatively refuses mixed durable/ignored dependency graphs and ignored protected tables. The supported runtime writer inventory and maintenance exclusions are recorded in the sibling `c-supported-runtime-writer-coverage-report.md`. Old binaries, raw SQL/import/restore/root maintenance and routine sync/merge can bypass the shared guard contract. Audit draining and generation invalidation are required operating boundaries and are not enforced here. Representative no-op and ignored-only no-history controls passed; ordered races for every writer class, mixed-graph concurrent changes, initializer failure rollback, concurrent operation IDs and external hook delivery need further acceptance evidence. Hooks remain best-effort and are skipped on replay; exactly-once script delivery is not promised.
+
+The Krewe candidate now has a registered read-only observation activity using actual native material, typed graph and captured clearance KV, plus the existing verified Temporal and Git/forge readers. It retains missing human history and review as explicit unknowns and grants no apply capability. Admission tests still use synthetic complete proofs. The existing `releaseBeadClaim` final write and full audit disposition pipeline are not converted to the native guard, so release, archive, clearance and plan gates remain open.
+
+The bounded full `make test` run under the approved CGO-disabled profile failed in five packages with 49 top-level failing names. An independently built untouched pinned baseline produced the same five packages and 49 names, with no candidate-only failure. This is not a green full gate. Required golangci-lint remains unavailable and was not installed. This branch is not claimed ready for upstream merge or deployment.

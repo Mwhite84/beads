@@ -127,11 +127,14 @@ func releaseWorkspaceGates() {
 }
 
 // commandNeedsExclusiveGate classifies the store-opening commands that
-// REPLACE storage rather than use it. Currently only `bd backup restore`
-// flows through the chokepoint and needs exclusivity; `bd init` and the
+// REPLACE or initialize storage rather than use it. `bd backup restore` and
+// experimental `bd guard initialize` need exclusivity here; `bd init` and the
 // `bd migrate from-*-to-*` family are in the skip-store lists and acquire
 // their exclusive gates inside their own Run functions instead.
 func commandNeedsExclusiveGate(cmd *cobra.Command) bool {
+	if isGuardCommand(cmd) && cmd.Name() == "initialize" {
+		return true
+	}
 	return cmd.Name() == "restore" && cmd.Parent() != nil && cmd.Parent().Name() == "backup"
 }
 
@@ -200,7 +203,7 @@ func acquireCommandWorkspaceGates(ctx context.Context, cmd *cobra.Command, beads
 	opts := workspacegate.Options{}
 	if exclusive {
 		mode = workspacegate.Exclusive
-		opts = exclusiveGateOptions("bd backup restore")
+		opts = exclusiveGateOptions(cmd.CommandPath())
 	}
 	h, err := workspacegate.AcquireAll(ctx, mode, opts, gates...)
 	if err != nil {

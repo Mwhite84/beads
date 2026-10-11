@@ -187,6 +187,8 @@ var readOnlyCommands = map[string]bool{
 	"backup":     true, // reads from Dolt, writes only to .beads/backup/
 	"export":     true, // reads from Dolt, writes JSONL to file/stdout
 	"tail":       true, // bd events tail: reads bd_events_journal, writes nothing
+	"capture":    true, // bd guard capture
+	"lookup":     true, // bd guard lookup
 }
 
 // isReadOnlyCommand returns true if the command only reads from the database.
@@ -1023,7 +1025,7 @@ var rootCmd = &cobra.Command{
 		// migrate among them -- never reach syncCommandContext to have it
 		// backfilled. A bare assignment leaves those commands reading a nil
 		// per-command context and losing Ctrl-C entirely.
-		setRootContext(setupGracefulShutdown())
+		setRootContext(setupGracefulShutdown(!isGuardCommand(cmd)))
 
 		// Initialize OTel. Telemetry is opt-in — initTelemetry is a noop
 		// unless BD_OTEL_ENABLED=true or a legacy BD_OTEL_* selector is set.
@@ -1535,6 +1537,13 @@ var rootCmd = &cobra.Command{
 		// has to change.
 		previewMode := isPreviewCommand(cmd)
 		policy := effectiveRootStorePolicy(cmd.Name(), readonlyMode)
+		if isGuardCommand(cmd) {
+			// Guard transport must not publish batch work or perform incidental
+			// migrations, startup or maintenance. Direct store schema checks
+			// retain their native behavior and still require disposable proof.
+			policy.runMaintenance = false
+			policy.disableAutoStart = true
+		}
 		useReadOnly := policy.readOnly || previewMode
 
 		// dc-6jaq: consult the migration freeze marker here, before any of
@@ -1741,6 +1750,9 @@ var rootCmd = &cobra.Command{
 				cmdCtx.ServerMode = doltCfg.ServerMode
 			}
 		}
+		if isGuardCommand(cmd) && (!doltCfg.ServerMode || doltCfg.ProxiedServer) {
+			return HandleError("guard: direct server storage is required; refusing before store construction")
+		}
 		// Defensive: embeddeddolt.New rejects an empty database name, so
 		// default it even on paths that never set one.
 		if doltCfg.Database == "" {
@@ -1887,7 +1899,7 @@ var rootCmd = &cobra.Command{
 		// Skip auto-import when the user is explicitly running "bd import" —
 		// the import command handles JSONL files itself and auto-importing
 		// first would interfere (double-import / upsert confusion).
-		if shouldRunAutoImportJSONL(cmd, store, useReadOnly, globalFlag, doltCfg.ServerMode) &&
+		if !isGuardCommand(cmd) && shouldRunAutoImportJSONL(cmd, store, useReadOnly, globalFlag, doltCfg.ServerMode) &&
 			!isDisablingImportAutoViaConfigCommand(cmd, args) {
 			maybeAutoImportJSONL(rootCtx, store, beadsDir)
 		}
@@ -1924,8 +1936,8 @@ var rootCmd = &cobra.Command{
 
 		// Load molecule templates from hierarchical catalog locations
 		// Templates are loaded after auto-import to ensure the database is up-to-date.
-		// Skip for import command to avoid conflicts during import operations.
-		if cmd.Name() != "import" && store != nil {
+		// Skip import conflicts and guard transport's unrelated catalog writes.
+		if !isGuardCommand(cmd) && cmd.Name() != "import" && store != nil {
 			// Reuse the resolved .beads directory (see the hook runner note
 			// above) so a registered WorkspaceIsBeadsDir workspace loads
 			// .beads/molecules.jsonl rather than <repo>/molecules.jsonl.
@@ -2011,7 +2023,7 @@ var rootCmd = &cobra.Command{
 			// plus previews: a --dry-run must not register a backup remote
 			// or write backup state. proxiedAutoBackupBackend decides the
 			// topology, so this stays inert off managed-local.
-			if runsPostCommandMaintenance(cmd.Name(), readonlyMode) && !isPreviewCommand(cmd) && !commandFreeze.Frozen() {
+			if !isGuardCommand(cmd) && runsPostCommandMaintenance(cmd.Name(), readonlyMode) && !isPreviewCommand(cmd) && !commandFreeze.Frozen() {
 				runPostRunAutoBackup(rootCtx)
 			}
 			if uowProvider != nil {
@@ -2028,7 +2040,7 @@ var rootCmd = &cobra.Command{
 			// of them. Guarding the outer block keeps that promise in one
 			// place instead of six. Writes never get here at all: they were
 			// refused in PersistentPreRunE.
-			if runsPostCommandMaintenance(cmd.Name(), readonlyMode) && !commandFreeze.Frozen() {
+			if !isGuardCommand(cmd) && runsPostCommandMaintenance(cmd.Name(), readonlyMode) && !commandFreeze.Frozen() {
 				// Dolt auto-commit: after a successful write command (and after final flush),
 				// create a Dolt commit so changes don't remain only in the working set.
 				if commandDidWrite.Load() && !commandDidExplicitDoltCommit {
@@ -2276,9 +2288,9 @@ func checkBlockedEnvVars() error {
 }
 
 // setupGracefulShutdown creates a context that cancels on SIGINT/SIGTERM/SIGHUP.
-// Before cancellation, it flushes pending batch commits so that accumulated
-// changes in the Dolt working set are not lost on graceful shutdown.
-func setupGracefulShutdown() (context.Context, context.CancelFunc) {
+// When permitted, it first flushes pending batch commits. Guard transport
+// disables this unrelated publication path, including for refused requests.
+func setupGracefulShutdown(flushBatch bool) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // G118: cancel is returned and called by caller
 
 	sigCh := make(chan os.Signal, 1)
@@ -2287,7 +2299,9 @@ func setupGracefulShutdown() (context.Context, context.CancelFunc) {
 	go func() {
 		select {
 		case <-sigCh:
-			flushBatchCommitOnShutdown()
+			if flushBatch {
+				flushBatchCommitOnShutdown()
+			}
 			cancel()
 			// On second signal, force exit
 			<-sigCh

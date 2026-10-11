@@ -13,6 +13,23 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 )
 
+// Ordinary boundary controls run against a capability-absent database. Match
+// the precise new probes in order without permitting token staging or writes.
+func expectOrdinaryGuardAbsent(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(`^SELECT COUNT\(\*\) FROM information_schema\.tables WHERE table_schema = DATABASE\(\) AND table_name = 'bd_guard_state'$`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+}
+
+func expectOrdinaryStagedWork(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery("^" + regexp.QuoteMeta("SELECT COUNT(*) FROM dolt_status WHERE staged = 1 AND table_name <> 'bd_guard_state'") + "$").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+}
+
+func expectOrdinaryPendingWork(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery("^" + regexp.QuoteMeta("SELECT COUNT(*) FROM dolt_status s WHERE s.table_name <> 'bd_guard_state' AND NOT EXISTS ( SELECT 1 FROM dolt_ignore di WHERE di.ignored = 1 AND s.table_name LIKE di.pattern )") + "$").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+}
+
 // TestDoltAddAndCommitDrainsCallResultSets pins doltAddAndCommit to routing its
 // CALL DOLT_ADD/CALL DOLT_COMMIT pair through schema.DrainCall (QueryContext +
 // a deferred Close) instead of plain ExecContext. See schema.DrainCall's doc
@@ -40,6 +57,7 @@ func TestDoltAddAndCommitDrainsCallResultSets(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM dolt_status WHERE staged = 1")).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	expectOrdinaryGuardAbsent(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 		WithArgs("bd: test commit", " <>").
 		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
@@ -88,6 +106,7 @@ func TestDoltAddAndCommitPostSQLFailuresAreIndeterminate(t *testing.T) {
 					WillReturnRows(sqlmock.NewRows([]string{"status"}))
 				mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM dolt_status WHERE staged = 1")).
 					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+				expectOrdinaryGuardAbsent(mock)
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 					WithArgs("bd: test commit", " <>").
 					WillReturnError(testConnectionLoss)
@@ -103,6 +122,7 @@ func TestDoltAddAndCommitPostSQLFailuresAreIndeterminate(t *testing.T) {
 					WillReturnRows(sqlmock.NewRows([]string{"status"}))
 				mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM dolt_status WHERE staged = 1")).
 					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+				expectOrdinaryGuardAbsent(mock)
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 					WithArgs("bd: test commit", " <>").
 					WillReturnError(&mysql.MySQLError{Number: 1213, Message: "deadlock"})
@@ -118,6 +138,7 @@ func TestDoltAddAndCommitPostSQLFailuresAreIndeterminate(t *testing.T) {
 					WillReturnRows(sqlmock.NewRows([]string{"status"}))
 				mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM dolt_status WHERE staged = 1")).
 					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+				expectOrdinaryGuardAbsent(mock)
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 					WithArgs("bd: test commit", " <>").
 					WillReturnError(&mysql.MySQLError{Number: 1205, Message: "lock wait timeout"})
@@ -209,6 +230,7 @@ func TestDoltAddAndCommitTreatsNothingToCommitAsSuccess(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM dolt_status WHERE staged = 1")).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	expectOrdinaryGuardAbsent(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 		WithArgs("bd: test commit", " <>").
 		WillReturnError(errors.New("nothing to commit"))
@@ -229,6 +251,8 @@ func TestCommitWithConfigCommitResponseLossIsIndeterminate(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
+	expectOrdinaryPendingWork(mock)
+	expectOrdinaryGuardAbsent(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")).
 		WithArgs("bd: test config commit", " <>").
 		WillReturnError(testConnectionLoss)
@@ -258,6 +282,8 @@ func TestCommitCommitResponseLossIsIndeterminate(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
 		WithArgs("issues").
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+	expectOrdinaryStagedWork(mock)
+	expectOrdinaryGuardAbsent(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 		WithArgs("bd: test commit", " <>").
 		WillReturnError(testConnectionLoss)
@@ -317,6 +343,8 @@ func TestPublicCommitAmbiguousConnectionFailuresTripCircuit(t *testing.T) {
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
 					WithArgs("issues").
 					WillReturnRows(sqlmock.NewRows([]string{"status"}))
+				expectOrdinaryStagedWork(mock)
+				expectOrdinaryGuardAbsent(mock)
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 					WithArgs("bd: test commit", " <>").
 					WillReturnError(testConnectionLoss)
@@ -333,6 +361,8 @@ func TestPublicCommitAmbiguousConnectionFailuresTripCircuit(t *testing.T) {
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
 					WithArgs("issues").
 					WillReturnRows(sqlmock.NewRows([]string{"status"}))
+				expectOrdinaryStagedWork(mock)
+				expectOrdinaryGuardAbsent(mock)
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 					WithArgs("bd: test merge commit", " <>").
 					WillReturnError(testConnectionLoss)
@@ -344,6 +374,8 @@ func TestPublicCommitAmbiguousConnectionFailuresTripCircuit(t *testing.T) {
 		{
 			name: "CommitWithConfig",
 			expect: func(mock sqlmock.Sqlmock) {
+				expectOrdinaryPendingWork(mock)
+				expectOrdinaryGuardAbsent(mock)
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")).
 					WithArgs("bd: test config commit", " <>").
 					WillReturnError(testConnectionLoss)
@@ -419,6 +451,7 @@ func TestDoltAddAndCommitInTxClassifiesCommitResponses(t *testing.T) {
 				WillReturnRows(sqlmock.NewRows([]string{"status"}))
 			mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM dolt_status WHERE staged = 1")).
 				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+			expectOrdinaryGuardAbsent(mock)
 			mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 				WithArgs("bd: test commit", " <>").
 				WillReturnError(tc.commitErr)

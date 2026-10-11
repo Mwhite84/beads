@@ -16,6 +16,25 @@ import (
 	publicops "github.com/steveyegge/beads/issueops"
 )
 
+// The custom drivers below model ordinary databases with no explicitly
+// initialized guard capability. Match complete normalized SQL, not an unknown
+// query fallback that might accidentally advertise a guarded database.
+func isOrdinaryGuardCapabilityProbe(query string) bool {
+	return strings.Join(strings.Fields(query), " ") == "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'bd_guard_state'"
+}
+
+// These legacy commit specimens have real native work to stage/commit. Only
+// the two native status count queries are allowed to report that count.
+func isOrdinaryNativeCommitCountQuery(query string) bool {
+	switch strings.Join(strings.Fields(query), " ") {
+	case "SELECT COUNT(*) FROM dolt_status WHERE staged = 1 AND table_name <> 'bd_guard_state'",
+		"SELECT COUNT(*) FROM dolt_status s WHERE s.table_name <> 'bd_guard_state' AND NOT EXISTS ( SELECT 1 FROM dolt_ignore di WHERE di.ignored = 1 AND s.table_name LIKE di.pattern )":
+		return true
+	default:
+		return false
+	}
+}
+
 // claimCommitBoundaryDriver models a permanent claim through its SQL mutation,
 // DOLT_ADD, and DOLT_COMMIT phases. It deliberately keeps the issue open after
 // rollback so an unsafe retry is visible as a second claim mutation.
@@ -85,6 +104,8 @@ func (c *claimCommitBoundaryConn) QueryContext(_ context.Context, query string, 
 	defer c.driver.mu.Unlock()
 
 	switch {
+	case isOrdinaryGuardCapabilityProbe(query):
+		return &claimCommitBoundaryRows{columns: []string{"count"}, values: [][]driver.Value{{int64(0)}}}, nil
 	case strings.Contains(query, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1"):
 		if c.driver.activeWisp {
 			return &claimCommitBoundaryRows{columns: []string{"exists"}, values: [][]driver.Value{{int64(1)}}}, nil
@@ -125,7 +146,7 @@ func (c *claimCommitBoundaryConn) QueryContext(_ context.Context, query string, 
 		return &claimCommitBoundaryRows{columns: []string{"name", "category"}}, nil
 	case strings.Contains(query, "SELECT value FROM config"):
 		return &claimCommitBoundaryRows{columns: []string{"value"}}, nil
-	case strings.Contains(query, "FROM dolt_status"):
+	case isOrdinaryNativeCommitCountQuery(query):
 		// Empty-commit guard (GH#4288 re-port): report one staged row so the
 		// commit paths under test still reach DOLT_COMMIT.
 		return &claimCommitBoundaryRows{columns: []string{"count"}, values: [][]driver.Value{{int64(1)}}}, nil

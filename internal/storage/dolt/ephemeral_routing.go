@@ -9,10 +9,12 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/steveyegge/beads/internal/storage/guardbirth"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/types"
@@ -211,7 +213,7 @@ func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor s
 		if err := issueops.PromoteFromEphemeralInTx(ctx, tx, id, actor); err != nil {
 			return err
 		}
-		return s.doltAddAndCommitInTx(ctx, tx, permanentIssueAuxTables, fmt.Sprintf("bd: promote %s", id))
+		return s.doltAddAndCommitInTx(ctx, tx, guardbirth.PublicationTables(tx, permanentIssueAuxTables), fmt.Sprintf("bd: promote %s", id))
 	}); err != nil {
 		return err
 	}
@@ -238,6 +240,9 @@ func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[str
 // atomic version precondition in the same transaction; DemoteToWisp's behavior
 // is unchanged.
 func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string) error {
+	if _, err := guardbirth.Spend(ctx, tx, id, actor, "durable-demotion"); err != nil {
+		return err
+	}
 	if _, err := issueops.UpdateIssueWithoutEventInTx(ctx, tx, id, updates, actor); err != nil {
 		return fmt.Errorf("update issue before demotion: %w", err)
 	}
@@ -331,7 +336,7 @@ func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string,
 		return err
 	}
 
-	return s.doltAddAndCommitInTx(ctx, tx, permanentIssueAuxTables, fmt.Sprintf("bd: demote %s to wisp", id))
+	return s.doltAddAndCommitInTx(ctx, tx, guardbirth.PublicationTables(tx, permanentIssueAuxTables), fmt.Sprintf("bd: demote %s to wisp", id))
 }
 
 // doltAddAndCommitInTx stages and Dolt-commits INSIDE a still-open SQL
@@ -358,6 +363,9 @@ func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string,
 // post-tx ordering; until then any of them racing a concurrent writer can
 // still silently revert that writer's committed rows.
 func (s *DoltStore) doltAddAndCommitInTx(ctx context.Context, tx *sql.Tx, tables []string, commitMsg string) error {
+	if err := guardtx.Prepare(ctx, tx); err != nil {
+		return err
+	}
 	// Batch/off auto-commit (bd-4wamg): leave the writes in the working set
 	// for a later explicit commit point (bd dolt commit / CommitPending)
 	// instead of minting one Dolt version commit per write.
@@ -388,6 +396,9 @@ func (s *DoltStore) doltAddAndCommitInTx(ctx context.Context, tx *sql.Tx, tables
 	}
 	if !staged {
 		return nil
+	}
+	if err := guardtx.Stage(ctx, tx); err != nil {
+		return err
 	}
 
 	if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",

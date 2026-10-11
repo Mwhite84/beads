@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 )
 
@@ -48,6 +49,9 @@ func StageAndCommit(ctx context.Context, conn DBConn, dirtyTables map[string]boo
 	if commitMsg == "" || len(dirtyTables) == 0 {
 		return nil
 	}
+	if err := guardtx.Prepare(ctx, conn); err != nil {
+		return err
+	}
 
 	// dirtyTables tracks tables touched by a write statement, but a statement
 	// can succeed without changing any rows (e.g. an idempotent
@@ -89,6 +93,9 @@ func StageAndCommit(ctx context.Context, conn DBConn, dirtyTables map[string]boo
 	}
 	if !staged {
 		return nil
+	}
+	if err := guardtx.Stage(ctx, conn); err != nil {
+		return err
 	}
 	if author == "" {
 		_, err = conn.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?)", commitMsg)

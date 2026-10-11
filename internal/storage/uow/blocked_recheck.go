@@ -6,6 +6,7 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 )
 
@@ -63,6 +64,12 @@ func (t *doltServerTx) recheckBlockedOnce(ctx context.Context, pending issueops.
 	if _, err := t.conn.ExecContext(ctx, "START TRANSACTION;"); err != nil {
 		return fmt.Errorf("begin recheck: %w", err)
 	}
+	// Each retry owns a fresh guard snapshot on this same pinned session.
+	defer guardtx.Forget(t.conn)
+	if err := guardtx.Bind(ctx, t.conn); err != nil {
+		return fmt.Errorf("uow: bind blocked recheck guard: %w", err)
+	}
+
 	result, err := issueops.RecomputeIsBlockedInTxWithResult(ctx, t.conn, pending.IssueIDs, pending.WispIDs)
 	if err != nil {
 		return err

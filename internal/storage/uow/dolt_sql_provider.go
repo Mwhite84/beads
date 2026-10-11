@@ -20,6 +20,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dbproxy/proxy"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/util"
 	db "github.com/steveyegge/beads/internal/storage/domain/db"
+	"github.com/steveyegge/beads/internal/storage/guardtx"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
@@ -196,6 +197,10 @@ func (p *doltSQLProvider) BeginTx(ctx context.Context) (Tx, error) {
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("uow: failed to start transaction: %w", err)
+	}
+	if err := guardtx.Bind(ctx, conn); err != nil {
+		failed := &doltServerTx{conn: conn}
+		return nil, failed.closeOpenTxAfterFailure(ctx, err)
 	}
 
 	// Bind journal activation to the connection this unit of work is pinned to,
