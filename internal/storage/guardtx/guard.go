@@ -56,8 +56,21 @@ var scopes sync.Map
 func Enabled(ctx context.Context, r Runner) (bool, error) {
 	var n int
 	err := r.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.tables
-		WHERE table_schema = DATABASE() AND table_name = 'bd_guard_state'`).Scan(&n)
-	return n == 1, err
+		WHERE table_schema = DATABASE() AND table_name IN ('bd_guard_state', 'bd_guard_operations')`).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	// A half-installed capability must never look like an ordinary unenrolled
+	// database. In particular, an operations-only schema otherwise bypasses
+	// Bind and allows native writes with no conflict-token participation.
+	switch n {
+	case 0:
+		return false, nil
+	case 2:
+		return true, nil
+	default:
+		return false, fmt.Errorf("%w: incomplete guard capability (%d tables)", ErrUnsupported, n)
+	}
 }
 
 // Bind must run after BEGIN and before native mutation. Disabled databases do

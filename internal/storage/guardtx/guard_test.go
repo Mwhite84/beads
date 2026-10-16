@@ -24,6 +24,7 @@ type guardImage struct {
 type guardFake struct {
 	image                                   guardImage
 	enabled                                 bool
+	capabilityTables                        *int64
 	bindErr, rootErr, stampErr, affectedErr error
 	affectedZero                            bool
 	commits, rollbacks, stampCalls          int
@@ -102,7 +103,10 @@ func (c *guardConn) QueryContext(_ context.Context, query string, args []driver.
 	case strings.Contains(query, "information_schema.tables"):
 		n := int64(0)
 		if c.fake.enabled {
-			n = 1
+			n = 2
+		}
+		if c.fake.capabilityTables != nil {
+			n = *c.fake.capabilityTables
 		}
 		return &guardRows{columns: []string{"count"}, values: []driver.Value{n}}, nil
 	case query == "SELECT "+guardExpectedRootExpression+", token, generation FROM bd_guard_state WHERE id = 1":
@@ -195,6 +199,25 @@ func guardFixture(t *testing.T) (*sql.DB, *guardFake) {
 		}
 	})
 	return db, fake
+}
+
+func TestPartialGuardCapabilityFailsClosedBeforeNativeMutation(t *testing.T) {
+	for _, count := range []int64{1, 3} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			db, fake := guardFixture(t)
+			fake.capabilityTables = &count
+			tx, err := BeginTx(context.Background(), db, nil)
+			if tx != nil || !errors.Is(err, ErrUnsupported) {
+				t.Fatalf("partial capability admitted a transaction: tx=%v err=%v", tx, err)
+			}
+			if fake.rollbacks != 1 || fake.commits != 0 || fake.stampCalls != 0 {
+				t.Fatalf("partial capability performed work: %+v", fake)
+			}
+			if len(fake.queries) != 1 || !strings.Contains(fake.queries[0], OperationsTable) {
+				t.Fatal("capability detection did not inspect both guard tables before binding")
+			}
+		})
+	}
 }
 
 func guardBegin(t *testing.T, db *sql.DB) *sql.Tx {
