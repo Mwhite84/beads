@@ -25,13 +25,14 @@ type ExplanationLookupRequest struct {
 	RequestDigest string `json:"requestDigest"`
 }
 type ExplanationResult struct {
-	Protocol      string `json:"protocol"`
-	OperationID   string `json:"operationId"`
-	RequestDigest string `json:"requestDigest"`
-	Outcome       string `json:"outcome"`
-	CommentID     string `json:"commentId,omitempty"`
-	Reason        string `json:"reason,omitempty"`
-	Replayed      bool   `json:"-"`
+	Protocol      string    `json:"protocol"`
+	OperationID   string    `json:"operationId"`
+	RequestDigest string    `json:"requestDigest"`
+	Outcome       string    `json:"outcome"`
+	ErrorCode     ErrorCode `json:"errorCode,omitempty"`
+	CommentID     string    `json:"commentId,omitempty"`
+	Reason        string    `json:"reason,omitempty"`
+	Replayed      bool      `json:"-"`
 }
 
 // ExplanationDeliverer is independent of Apply: delivery identity binds the

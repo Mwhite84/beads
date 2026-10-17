@@ -66,12 +66,13 @@ type LookupRequest struct {
 	RequestDigest string `json:"requestDigest"`
 }
 type Result struct {
-	Protocol      string `json:"protocol"`
-	OperationID   string `json:"operationId"`
-	RequestDigest string `json:"requestDigest"`
-	Outcome       string `json:"outcome"`
-	Reason        string `json:"reason,omitempty"`
-	ResultJSON    string `json:"resultJson,omitempty"`
+	Protocol      string    `json:"protocol"`
+	OperationID   string    `json:"operationId"`
+	RequestDigest string    `json:"requestDigest"`
+	Outcome       string    `json:"outcome"`
+	ErrorCode     ErrorCode `json:"errorCode,omitempty"`
+	Reason        string    `json:"reason,omitempty"`
+	ResultJSON    string    `json:"resultJson,omitempty"`
 	// Replayed is local completion-hook bookkeeping, not a wire assertion.
 	Replayed bool `json:"-"`
 }

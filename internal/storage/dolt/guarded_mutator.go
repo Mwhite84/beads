@@ -224,13 +224,14 @@ func lookupGuardOperation(ctx context.Context, tx *sql.Tx, r guardops.LookupRequ
 	}
 	if digest != r.RequestDigest {
 		result.Outcome = "request-mismatch"
+		result.ErrorCode = guardops.CodeRequestMismatch
 		return result, nil
 	}
 	var saved guardops.Result
 	if err := json.Unmarshal([]byte(raw), &saved); err != nil {
 		return result, err
 	}
-	if saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.OperationID != r.OperationID || saved.RequestDigest != digest {
+	if saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.OperationID != r.OperationID || saved.RequestDigest != digest || saved.ErrorCode != "" {
 		return result, fmt.Errorf("guard: invalid durable operation record")
 	}
 	return saved, nil
@@ -239,6 +240,7 @@ func lookupGuardOperation(ctx context.Context, tx *sql.Tx, r guardops.LookupRequ
 func (g *guardedMutator) Lookup(ctx context.Context, r guardops.LookupRequest) (guardops.Result, error) {
 	result := guardops.Result{Protocol: guardops.Protocol, OperationID: r.OperationID, RequestDigest: r.RequestDigest, Outcome: "unknown"}
 	if err := guardops.ValidateLookup(r); err != nil {
+		result.ErrorCode = guardops.CodeInvalidRequest
 		return result, err
 	}
 	err := g.withGuardReadTx(ctx, func(tx *sql.Tx) error {
@@ -248,7 +250,7 @@ func (g *guardedMutator) Lookup(ctx context.Context, r guardops.LookupRequest) (
 	})
 	if err != nil {
 		result.Outcome = "unknown"
-		result.Reason = err.Error()
+		result.ErrorCode = guardedErrorCode(err, false)
 	}
 	return result, err
 }
@@ -259,12 +261,12 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 	digest := guardops.Digest(r)
 	result := guardops.Result{Protocol: guardops.Protocol, OperationID: r.OperationID, RequestDigest: digest, Outcome: "refused"}
 	if err := guardops.ValidateRequest(r); err != nil {
-		result.Reason = err.Error()
+		result.ErrorCode = guardops.CodeInvalidRequest
 		return result, err
 	}
 	if storageissueops.VersionCommitDeferred(ctx) {
 		err := fmt.Errorf("%w: guarded application requires native history publication", guardtx.ErrUnsupported)
-		result.Reason = err.Error()
+		result.ErrorCode = guardops.CodeHistoryPublicationRequired
 		return result, err
 	}
 	lookup := guardops.LookupRequest{Protocol: guardops.Protocol, OperationID: r.OperationID, RequestDigest: digest}
@@ -467,7 +469,8 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 	})
 	if err != nil {
 		result.ResultJSON = ""
-		result.Reason = err.Error()
+		result.Reason = ""
+		result.ErrorCode = guardedErrorCode(err, publicationStarted)
 		switch {
 		case publicationStarted, errors.Is(err, ErrCommitIndeterminate):
 			result.Outcome = "unknown"
@@ -487,7 +490,8 @@ func (g *guardedMutator) Apply(ctx context.Context, r guardops.Request) (guardop
 	if err != nil || verified.Outcome != "applied" {
 		result.Outcome = "unknown"
 		result.ResultJSON = ""
-		result.Reason = "protected commit not yet resolved by operation lookup"
+		result.Reason = ""
+		result.ErrorCode = guardops.CodeLookupUnconfirmed
 		return result, err
 	}
 	verified.Replayed = result.Replayed
@@ -929,7 +933,7 @@ func verifyAuditClearanceProvenance(ctx context.Context, tx *sql.Tx, r guardops.
 				return err
 			}
 			var saved guardops.Result
-			if json.Unmarshal([]byte(savedRaw), &saved) != nil || saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.OperationID != initial.Value.OperationID {
+			if json.Unmarshal([]byte(savedRaw), &saved) != nil || saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.ErrorCode != "" || saved.OperationID != initial.Value.OperationID {
 				return guardtx.ErrUnsupported
 			}
 			linked, err := attestInitialNativeRecord(ctx, tx, guardops.RecordAttestationRequest{Expected: r.Expected, RecordKey: record.Key, RecordValue: record.Value}, saved)
@@ -971,7 +975,7 @@ func verifyAuditClearanceProvenance(ctx context.Context, tx *sql.Tx, r guardops.
 			HistoryKey               string `json:"historyKey"`
 			ClearLabelEventIDsDigest string `json:"clearLabelEventIdsDigest"`
 		}
-		if json.Unmarshal([]byte(raw), &saved) != nil || saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.OperationID != h.Value.OperationID || json.Unmarshal([]byte(saved.ResultJSON), &result) != nil || result.IssueID != r.Expected.IssueID || !result.Cleared || result.HistoryComplete == nil || *result.HistoryComplete || result.MaterialVersion != h.Value.Clearance.MaterialVersion || result.RemovalEventID == "" || result.HistoryKey != record.Key || h.Value.GuardGeneration != r.Expected.Generation {
+		if json.Unmarshal([]byte(raw), &saved) != nil || saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.ErrorCode != "" || saved.OperationID != h.Value.OperationID || json.Unmarshal([]byte(saved.ResultJSON), &result) != nil || result.IssueID != r.Expected.IssueID || !result.Cleared || result.HistoryComplete == nil || *result.HistoryComplete || result.MaterialVersion != h.Value.Clearance.MaterialVersion || result.RemovalEventID == "" || result.HistoryKey != record.Key || h.Value.GuardGeneration != r.Expected.Generation {
 			return fmt.Errorf("%w: legacy or unlinked native clearance result", guardtx.ErrUnsupported)
 		}
 		var clearanceRaw string
@@ -1116,7 +1120,7 @@ func (g *guardedMutator) AttestRecord(ctx context.Context, r guardops.RecordAtte
 				continue
 			}
 			var saved guardops.Result
-			if json.Unmarshal([]byte(e.raw), &saved) != nil || saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.OperationID != e.id || saved.RequestDigest != e.digest || guardops.ValidateLookup(guardops.LookupRequest{Protocol: guardops.Protocol, OperationID: e.id, RequestDigest: e.digest}) != nil {
+			if json.Unmarshal([]byte(e.raw), &saved) != nil || saved.Protocol != guardops.Protocol || saved.Outcome != "applied" || saved.ErrorCode != "" || saved.OperationID != e.id || saved.RequestDigest != e.digest || guardops.ValidateLookup(guardops.LookupRequest{Protocol: guardops.Protocol, OperationID: e.id, RequestDigest: e.digest}) != nil {
 				continue
 			}
 			linked, err := attestNativeAuditRecord(ctx, tx, r, saved)

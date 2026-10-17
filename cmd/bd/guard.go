@@ -104,11 +104,11 @@ func init() {
 			}
 			role, err := commandGuardedMutator()
 			if err != nil {
-				return err
+				return outputJSONRaw(guardops.Result{Protocol: guardops.Protocol, OperationID: request.OperationID, RequestDigest: guardops.Digest(request), Outcome: "refused", ErrorCode: guardops.CodeCapabilityUnavailable})
 			}
 			ctx, err := issueOpsContext(rootCtx)
 			if err != nil {
-				return err
+				return outputJSONRaw(guardops.Result{Protocol: guardops.Protocol, OperationID: request.OperationID, RequestDigest: guardops.Digest(request), Outcome: "refused", ErrorCode: guardops.CodeContextUnavailable})
 			}
 			result, _ := role.Apply(ctx, request)
 			// Typed business refusals/conflicts/unknowns are protocol results.
@@ -132,7 +132,7 @@ func init() {
 			}
 			role, err := commandGuardedMutator()
 			if err != nil {
-				return err
+				return outputJSONRaw(guardops.Result{Protocol: guardops.Protocol, OperationID: request.OperationID, RequestDigest: request.RequestDigest, Outcome: "unknown", ErrorCode: guardops.CodeCapabilityUnavailable})
 			}
 			result, _ := role.Lookup(rootCtx, request)
 			return outputJSONRaw(result)

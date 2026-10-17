@@ -27,11 +27,11 @@ func init() {
 		}
 		role, err := commandGuardedExplanation()
 		if err != nil {
-			return err
+			return outputJSONRaw(guardops.ExplanationResult{Protocol: guardops.ExplanationProtocol, OperationID: request.OperationID, RequestDigest: guardops.ExplanationDigest(request), Outcome: "refused", ErrorCode: guardops.CodeCapabilityUnavailable})
 		}
 		ctx, err := issueOpsContext(rootCtx)
 		if err != nil {
-			return err
+			return outputJSONRaw(guardops.ExplanationResult{Protocol: guardops.ExplanationProtocol, OperationID: request.OperationID, RequestDigest: guardops.ExplanationDigest(request), Outcome: "refused", ErrorCode: guardops.CodeContextUnavailable})
 		}
 		result, _ := role.Explain(ctx, request)
 		if result.Outcome == "applied" && !result.Replayed {
@@ -47,7 +47,7 @@ func init() {
 		}
 		role, err := commandGuardedExplanation()
 		if err != nil {
-			return err
+			return outputJSONRaw(guardops.ExplanationResult{Protocol: guardops.ExplanationProtocol, OperationID: request.OperationID, RequestDigest: request.RequestDigest, Outcome: "unknown", ErrorCode: guardops.CodeCapabilityUnavailable})
 		}
 		result, _ := role.LookupExplanation(rootCtx, request)
 		return outputJSONRaw(result)

@@ -92,12 +92,13 @@ func lookupExplanation(ctx context.Context, tx *sql.Tx, r guardops.ExplanationLo
 	}
 	if digest != r.RequestDigest {
 		result.Outcome = "request-mismatch"
+		result.ErrorCode = guardops.CodeRequestMismatch
 		return result, nil
 	}
 	var saved guardops.ExplanationResult
 	d := json.NewDecoder(strings.NewReader(raw))
 	d.DisallowUnknownFields()
-	if d.Decode(&saved) != nil || saved.Protocol != guardops.ExplanationProtocol || saved.OperationID != r.OperationID || saved.RequestDigest != digest || saved.Outcome != "applied" || !nativeEventID(saved.CommentID) || saved.Reason != "" {
+	if d.Decode(&saved) != nil || saved.Protocol != guardops.ExplanationProtocol || saved.OperationID != r.OperationID || saved.RequestDigest != digest || saved.Outcome != "applied" || !nativeEventID(saved.CommentID) || saved.Reason != "" || saved.ErrorCode != "" {
 		return result, fmt.Errorf("guard: invalid durable explanation delivery")
 	}
 	return saved, nil
@@ -105,14 +106,14 @@ func lookupExplanation(ctx context.Context, tx *sql.Tx, r guardops.ExplanationLo
 func (g *guardedMutator) LookupExplanation(ctx context.Context, r guardops.ExplanationLookupRequest) (guardops.ExplanationResult, error) {
 	result := guardops.ExplanationResult{Protocol: guardops.ExplanationProtocol, OperationID: r.OperationID, RequestDigest: r.RequestDigest, Outcome: "unknown"}
 	if err := guardops.ValidateExplanationLookup(r); err != nil {
-		result.Reason = err.Error()
+		result.ErrorCode = guardops.CodeInvalidRequest
 		return result, err
 	}
 	err := g.withGuardReadTx(ctx, func(tx *sql.Tx) error { var err error; result, err = lookupExplanation(ctx, tx, r); return err })
 	if err != nil {
 		result.Outcome = "unknown"
 		result.CommentID = ""
-		result.Reason = err.Error()
+		result.ErrorCode = guardedErrorCode(err, false)
 	}
 	return result, err
 }
@@ -120,12 +121,12 @@ func (g *guardedMutator) Explain(ctx context.Context, r guardops.ExplanationRequ
 	digest := guardops.ExplanationDigest(r)
 	result := guardops.ExplanationResult{Protocol: guardops.ExplanationProtocol, OperationID: r.OperationID, RequestDigest: digest, Outcome: "refused"}
 	if err := guardops.ValidateExplanation(r); err != nil {
-		result.Reason = err.Error()
+		result.ErrorCode = guardops.CodeInvalidRequest
 		return result, err
 	}
 	if storageissueops.VersionCommitDeferred(ctx) {
 		err := fmt.Errorf("%w: explanation requires native history publication", guardtx.ErrUnsupported)
-		result.Reason = err.Error()
+		result.ErrorCode = guardops.CodeHistoryPublicationRequired
 		return result, err
 	}
 	publicationStarted := false
@@ -195,7 +196,8 @@ func (g *guardedMutator) Explain(ctx context.Context, r guardops.ExplanationRequ
 	})
 	if err != nil {
 		result.CommentID = ""
-		result.Reason = err.Error()
+		result.Reason = ""
+		result.ErrorCode = guardedErrorCode(err, publicationStarted)
 		switch {
 		case publicationStarted, errors.Is(err, ErrCommitIndeterminate):
 			result.Outcome = "unknown"
@@ -215,7 +217,8 @@ func (g *guardedMutator) Explain(ctx context.Context, r guardops.ExplanationRequ
 	if err != nil || verified.Outcome != "applied" {
 		result.Outcome = "unknown"
 		result.CommentID = ""
-		result.Reason = "protected explanation not yet resolved by operation lookup"
+		result.Reason = ""
+		result.ErrorCode = guardops.CodeLookupUnconfirmed
 		return result, err
 	}
 	verified.Replayed = result.Replayed

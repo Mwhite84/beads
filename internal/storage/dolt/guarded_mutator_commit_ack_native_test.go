@@ -145,7 +145,7 @@ func TestGuardedNativeSQLCommitAckLossRecoversByIndependentLookup(t *testing.T) 
 	if !errors.Is(err, io.ErrUnexpectedEOF) || !errors.Is(err, ErrCommitIndeterminate) || uncertain.Outcome != "unknown" {
 		t.Fatalf("lost successful SQL commit acknowledgement was not unknown: result=%+v err=%v", uncertain, err)
 	}
-	if uncertain.Protocol != guardops.Protocol || uncertain.OperationID != request.OperationID || uncertain.RequestDigest != guardops.Digest(request) || uncertain.ResultJSON != "" || uncertain.Replayed || uncertain.Reason == "" {
+	if uncertain.Protocol != guardops.Protocol || uncertain.OperationID != request.OperationID || uncertain.RequestDigest != guardops.Digest(request) || uncertain.ResultJSON != "" || uncertain.Replayed || uncertain.Reason != "" || uncertain.ErrorCode != guardops.CodePublicationUnconfirmed {
 		t.Fatalf("unknown outcome asserted completion or lost exact request identity: %+v", uncertain)
 	}
 	if fault.commitCalls.Load() != 1 || fault.successfulCommits.Load() != 1 || fault.lostAcknowledgements.Load() != 1 {
